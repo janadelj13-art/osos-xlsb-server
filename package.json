@@ -1,0 +1,18 @@
+{
+  "name": "osos-xlsb-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "سيرفر بسيط لتحويل ملفات الإكسل إلى XLSB - معالجة في الذاكرة فقط بدون تخزين",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "multer": "^2.0.2",
+    "xlsx": "^0.18.5"
+  }
+}
