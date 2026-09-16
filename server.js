@@ -89,13 +89,45 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+const CERT_RESOLVE_PER_ITEM_TIMEOUT_MS = 15000; // 15 ثانية أقصى حد للملف الواحد — لو زاد، نعتبره فشل ونكمل اللي بعده
+
+function withTimeout(promise, ms, fallbackValue) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; resolve(fallbackValue); }
+    }, ms);
+    promise.then((v) => {
+      if (!settled) { settled = true; clearTimeout(timer); resolve(v); }
+    }).catch(() => {
+      if (!settled) { settled = true; clearTimeout(timer); resolve(fallbackValue); }
+    });
+  });
+}
+
+async function resolveOnePlateRaw(id) {
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS);
+  try {
+    const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", { signal: controller.signal });
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    const pdf = await getDocumentProxy(new Uint8Array(buf));
+    const { text } = await extractText(pdf, { mergePages: true });
+    return text ? extractPlateFromText(text) : null;
+  } finally {
+    clearTimeout(abortTimer);
+  }
+}
+
+// طبقة حماية إضافية: حتى لو الـ fetch نجح بس استخراج النص نفسه علّق (ملف تالف مثلًا)،
+// بعد 15 ثانية بنعتبره فشل ونرجع null بدل ما نستنى للأبد
 async function resolveOnePlate(id) {
-  const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download");
-  if (!res.ok) return null;
-  const buf = await res.arrayBuffer();
-  const pdf = await getDocumentProxy(new Uint8Array(buf));
-  const { text } = await extractText(pdf, { mergePages: true });
-  return text ? extractPlateFromText(text) : null;
+  try {
+    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS, null);
+  } catch (e) {
+    return null;
+  }
 }
 
 // جسم الطلب: { ids: ["driveFileId1", "driveFileId2", ...] }
