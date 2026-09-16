@@ -125,7 +125,7 @@ function extractPlateFromText(text) {
 
 const OCR_LANG_PATH = path.join(__dirname, "node_modules", "@tesseract.js-data", "ara", "4.0.0_best_int");
 const OCR_RENDER_SCALE = 2.5; // كل ما زاد، وضحت الصورة أكتر لكن استخرج أبطأ وأتقل على الرام
-const OCR_TIMEOUT_MS = 45000; // 45 ثانية أقصى حد لعملية التصوير+القراءة الواحدة
+const OCR_TIMEOUT_MS = 20000; // 20 ثانية مؤقتًا للتشخيص (كانت 45) — عشان نلاقي أي تعليق بسرعة أكتر
 
 let ocrWorkerPromise = null;
 function getOcrWorker() {
@@ -148,14 +148,19 @@ function runInOcrQueue(fn) {
   return run;
 }
 
-async function ocrArabicPlate(pdf) {
+async function ocrArabicPlate(pdf, debugId) {
   return runInOcrQueue(async () => {
+    const t0 = Date.now();
+    console.log("[ocr] id=" + debugId + " step=start");
     const worker = await getOcrWorker();
+    console.log("[ocr] id=" + debugId + " step=worker-ready ms=" + (Date.now() - t0));
     const imageBuffer = await renderPageAsImage(pdf, 1, {
       canvasImport: () => import("@napi-rs/canvas"),
       scale: OCR_RENDER_SCALE
     });
+    console.log("[ocr] id=" + debugId + " step=rendered ms=" + (Date.now() - t0) + " bytes=" + imageBuffer.byteLength);
     const { data: { text } } = await worker.recognize(Buffer.from(imageBuffer));
+    console.log("[ocr] id=" + debugId + " step=recognized ms=" + (Date.now() - t0) + " text=" + JSON.stringify(String(text || "").slice(0, 300)));
     return text ? extractPlateFromText(text) : null;
   });
 }
@@ -206,7 +211,7 @@ async function resolveOnePlateRaw(id) {
     if (!result) {
       // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
       // في الفونت نفسه)، فنحول الصفحة لصورة ونقراها بالعربي (OCR) بدل النص
-      result = await withTimeout(ocrArabicPlate(pdf), OCR_TIMEOUT_MS, null);
+      result = await withTimeout(ocrArabicPlate(pdf, id), OCR_TIMEOUT_MS, null);
     }
     return result;
   } finally {
