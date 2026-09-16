@@ -22,6 +22,7 @@ const XLSX = require("xlsx");
 const cors = require("cors");
 const path = require("path");
 const { extractText, getDocumentProxy, renderPageAsImage } = require("unpdf");
+const { createCanvas, loadImage } = require("@napi-rs/canvas");
 const { createWorker } = require("tesseract.js");
 
 const app = express();
@@ -59,8 +60,10 @@ const SEP = "[\\s\\-]*";
 // نفس ترتيب الأنماط اللي كانت شغالة في المتصفح، منقولة هنا بالظبط عشان النتيجة متطابقة
 // (دي طريقة احتياطية، بتتفتش لو الطريقة الأدق اللي تحت (بالعنوان) مالقتش حاجة)
 const CERT_PLATE_PATTERNS = [
-  { re: new RegExp("((?:[\\u0621-\\u064A]" + SEP + "){3})(?![\\u0621-\\u064A])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true },
-  { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[\\u0621-\\u064A]" + SEP + "){3})(?![\\u0621-\\u064A])"), lettersFirst: false },
+  // العربي: {2,4} مش {3} بالظبط — مرونة لضوضاء الـOCR (حرف زيادة أو ناقص)
+  { re: new RegExp("((?:[\\u0621-\\u064A]" + SEP + "){2,4})(?![\\u0621-\\u064A])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true },
+  { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[\\u0621-\\u064A]" + SEP + "){2,4})(?![\\u0621-\\u064A])"), lettersFirst: false },
+  // الإنجليزي: فاضل {3} بالظبط لأنه من نص حقيقي مش OCR، دقيق أصلًا
   { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[A-Za-z]" + SEP + "){3})(?![A-Za-z])"), lettersFirst: false },
   { re: new RegExp("(?:^|[^A-Za-z])((?:[A-Za-z]" + SEP + "){3})(?![A-Za-z])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true }
 ];
@@ -84,7 +87,9 @@ function grabPlateAfterLabel(text, labelRe, letterClass, stopRe) {
     if (stopM) end = start + stopM.index;
   }
   const windowText = text.slice(start, end);
-  const lettersRe = new RegExp("(?:[" + letterClass + "]" + SEP + "){3}(?![" + letterClass + "])");
+  // {2,4} مش {3} بالظبط — عشان الـOCR أحيانًا بيقرا حرف زيادة أو ناقص غلط، فمرونة بسيطة
+  // في عدد الحروف بتخلينا نمسك اللوحة برضه بدل ما نرفضها تمامًا لمجرد فرق حرف واحد
+  const lettersRe = new RegExp("(?:[" + letterClass + "]" + SEP + "){2,4}(?![" + letterClass + "])");
   const lettersMatch = windowText.match(lettersRe);
   const digitsMatch = windowText.match(/(\d{4})(?!\d)/);
   if (!lettersMatch || !digitsMatch) return null;
@@ -124,8 +129,8 @@ function extractPlateFromText(text) {
  * ================================================================= */
 
 const OCR_LANG_PATH = path.join(__dirname, "node_modules", "@tesseract.js-data", "ara", "4.0.0_best_int");
-const OCR_RENDER_SCALE = 2.5; // كل ما زاد، وضحت الصورة أكتر لكن استخرج أبطأ وأتقل على الرام
-const OCR_TIMEOUT_MS = 20000; // 20 ثانية مؤقتًا للتشخيص (كانت 45) — عشان نلاقي أي تعليق بسرعة أكتر
+const OCR_RENDER_SCALE = 8; // دقة عالية — مضمونة سريعة دلوقتي لأننا بنقص المنطقة المطلوبة بس غالبًا
+const OCR_TIMEOUT_MS = 30000; // 30 ثانية — كافية جدًا (بالتجربة الفعلية بياخد ثانية-اتنين بس)
 
 let ocrWorkerPromise = null;
 function getOcrWorker() {
@@ -148,18 +153,61 @@ function runInOcrQueue(fn) {
   return run;
 }
 
+// نلاقي مكان سطر رقم اللوحة العربي من غير ما نحتاج نقرا الحروف المشوهة خالص:
+// بندور على "عنصر نص" شكله رقم من 4 خانات ومعاه كام رمز مش إنجليزي بعده مباشرة
+// (ده بالظبط شكل سطر اللوحة العربي زي ما بيطلع من استخراج النص العادي، حتى لو
+// الحروف نفسها مش مفهومة) — واستخدام موقعه (y) عشان نعرف نقص الصورة عليه بس.
+function findArabicPlateAnchor(items) {
+  for (const it of items) {
+    const s = it.str || "";
+    const m = s.match(/^(\d{4})\s+(.+)$/);
+    if (!m) continue;
+    if (/[A-Za-z]/.test(m[2])) continue; // ده سطر إنجليزي (زي "9496 A J S")، مش اللي محتاجينه
+    if (m[2].replace(/\s+/g, "").length > 10) continue; // طويل قوي، مش شكل 3-4 حروف لوحة
+    return it;
+  }
+  return null;
+}
+
 async function ocrArabicPlate(pdf, debugId) {
   return runInOcrQueue(async () => {
     const t0 = Date.now();
     console.log("[ocr] id=" + debugId + " step=start");
     const worker = await getOcrWorker();
-    console.log("[ocr] id=" + debugId + " step=worker-ready ms=" + (Date.now() - t0));
-    const imageBuffer = await renderPageAsImage(pdf, 1, {
+
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale: 1.0 });
+    const content = await page.getTextContent();
+    const anchor = findArabicPlateAnchor(content.items);
+
+    // لو ملقيناش مكان السطر (تصميم شهادة مختلف مثلًا)، نرجع للطريقة القديمة:
+    // تصوير الصفحة كاملة (أبطأ، لكن أضمن كحل احتياطي)
+    const scale = OCR_RENDER_SCALE;
+    const fullImageBuffer = await renderPageAsImage(pdf, 1, {
       canvasImport: () => import("@napi-rs/canvas"),
-      scale: OCR_RENDER_SCALE
+      scale
     });
-    console.log("[ocr] id=" + debugId + " step=rendered ms=" + (Date.now() - t0) + " bytes=" + imageBuffer.byteLength);
-    const { data: { text } } = await worker.recognize(Buffer.from(imageBuffer));
+
+    let targetBuffer = Buffer.from(fullImageBuffer);
+    if (anchor) {
+      const img = await loadImage(targetBuffer);
+      const fontSize = anchor.transform[0];
+      const yBaseline = anchor.transform[5];
+      const yTopPdf = yBaseline + fontSize * 1.6; // هامش فوق السطر (يغطي الهمزة وعلامات التشكيل)
+      const yBottomPdf = yBaseline - fontSize * 0.8; // هامش تحت السطر
+      const cropTopPx = Math.max(0, Math.round((viewport.height - yTopPdf) * scale));
+      const cropBottomPx = Math.min(img.height, Math.round((viewport.height - yBottomPdf) * scale));
+      const cropHeightPx = cropBottomPx - cropTopPx;
+      if (cropHeightPx > 4) {
+        const cropCanvas = createCanvas(img.width, cropHeightPx);
+        const ctx = cropCanvas.getContext("2d");
+        ctx.drawImage(img, 0, cropTopPx, img.width, cropHeightPx, 0, 0, img.width, cropHeightPx);
+        targetBuffer = cropCanvas.toBuffer("image/png");
+      }
+    }
+    console.log("[ocr] id=" + debugId + " step=rendered ms=" + (Date.now() - t0) + " cropped=" + !!anchor + " bytes=" + targetBuffer.length);
+
+    const { data: { text } } = await worker.recognize(targetBuffer);
     console.log("[ocr] id=" + debugId + " step=recognized ms=" + (Date.now() - t0) + " text=" + JSON.stringify(String(text || "").slice(0, 300)));
     return text ? extractPlateFromText(text) : null;
   });
