@@ -10,9 +10,12 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "@tesseract.js-data/ara": "^1.0.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "multer": "^2.0.2",
+    "tesseract.js": "^7.0.0",
     "unpdf": "^1.8.1",
     "xlsx": "^0.18.5"
   }
