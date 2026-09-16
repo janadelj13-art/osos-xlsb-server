@@ -51,6 +51,10 @@ const CERT_DOWNLOAD_BASE = "https://osos-certificates.ososapp.workers.dev";
 const CERT_RESOLVE_MAX_IDS = 20; // سقف أمان لعدد الملفات في الطلب الواحد (كان 30 — قللناه)
 const CERT_RESOLVE_CONCURRENCY = 3; // كام ملف بيتفتح بالتوازي جوه نفس الطلب (كان 6 — قللناه عشان Render Free)
 
+// عداد مؤقت للتصحيح — بيتصفر مع كل إعادة تشغيل للسيرفر (Deploy جديد)
+let RAW_DEBUG_COUNT = 0;
+const RAW_DEBUG_LIMIT = 5;
+
 // فاصل مسموح بين حروف اللوحة أو بينها وبين الأرقام: مسافة أو شرطة (كان بس مسافة قبل كده)
 const SEP = "[\\s\\-]*";
 
@@ -151,10 +155,17 @@ async function resolveOnePlateRaw(id) {
     const pdf = await getDocumentProxy(new Uint8Array(buf));
     const { text } = await extractText(pdf, { mergePages: true });
     const result = text ? extractPlateFromText(text) : null;
-    // تصحيح مؤقت: لو فشل الاستخراج، نسجل جزء من النص الخام في اللوجز
-    // عشان نقدر نلاقيه لاحقًا في Render > Logs بالبحث برقم اللوحة (مثلاً 9496)
+    // تصحيح مؤقت (مرحلة 1): لو فشل الاستخراج تمامًا، نسجل جزء من النص الخام
     if (!result) {
       console.log("[plate-miss] id=" + id + " text=" + JSON.stringify(String(text || "").replace(/\s+/g, " ").slice(0, 600)));
+    }
+    // تصحيح مؤقت (مرحلة 2): أول 5 ملفات بس — نسجل النص الخام كامل كما هو (من غير
+    // أي تعديل) حتى لو الاستخراج نجح، عشان نشوف هل ترتيب/شكل الحروف العربي
+    // طالع سليم من مكتبة الاستخراج ولا معكوس — ده اللي هيوضحلنا سبب فشل
+    // "رقم اللوحة بالعربي" حتى لما بيكون موجود فعليًا في الشهادة
+    if (RAW_DEBUG_COUNT < RAW_DEBUG_LIMIT) {
+      RAW_DEBUG_COUNT++;
+      console.log("[plate-raw #" + RAW_DEBUG_COUNT + "] id=" + id + " result=" + JSON.stringify(result) + " text=" + JSON.stringify(String(text || "").slice(0, 1000)));
     }
     return result;
   } finally {
