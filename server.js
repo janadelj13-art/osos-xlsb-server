@@ -21,8 +21,8 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const cors = require("cors");
 const path = require("path");
-const { extractText, getDocumentProxy, renderPageAsImage } = require("unpdf");
-const { createCanvas, loadImage } = require("@napi-rs/canvas");
+const { extractText, getDocumentProxy, renderPageAsImage, createIsomorphicCanvasFactory } = require("unpdf");
+const { createCanvas } = require("@napi-rs/canvas");
 const { createWorker } = require("tesseract.js");
 
 const app = express();
@@ -176,38 +176,70 @@ async function ocrArabicPlate(pdf, debugId) {
     const worker = await getOcrWorker();
 
     const page = await pdf.getPage(1);
-    const viewport = page.getViewport({ scale: 1.0 });
+    const viewport1x = page.getViewport({ scale: 1.0 });
     const content = await page.getTextContent();
     const anchor = findArabicPlateAnchor(content.items);
 
-    // لو ملقيناش مكان السطر (تصميم شهادة مختلف مثلًا)، نرجع للطريقة القديمة:
-    // تصوير الصفحة كاملة (أبطأ، لكن أضمن كحل احتياطي)
     const scale = OCR_RENDER_SCALE;
-    const fullImageBuffer = await renderPageAsImage(pdf, 1, {
-      canvasImport: () => import("@napi-rs/canvas"),
-      scale
-    });
+    let targetBuffer;
 
-    let targetBuffer = Buffer.from(fullImageBuffer);
     if (anchor) {
-      const img = await loadImage(targetBuffer);
+      // مهم لاستهلاك الذاكرة على السيرفر: بدل ما نرسم الصفحة A4 كاملة بدقة عالية
+      // (ممكن توصل لأكتر من 100 ميجا في الذاكرة للصفحة الواحدة) وبعدين نقص منها،
+      // بنرسم على كانفاس صغير بحجم السطر المطلوب بس من الأول (كذا ميجا بالكتير)
+      // — بنزيح نقطة الرسم لفوق (translate) عشان السطر اللي عايزينه يظهر جوه
+      // حدود الكانفاس الصغير، وأي حاجة برة الحدود دي متترسمش أصلًا (متتاخدش
+      // مساحة في الذاكرة).
       const fontSize = anchor.transform[0];
       const yBaseline = anchor.transform[5];
       const yTopPdf = yBaseline + fontSize * 1.6; // هامش فوق السطر (يغطي الهمزة وعلامات التشكيل)
       const yBottomPdf = yBaseline - fontSize * 0.8; // هامش تحت السطر
-      const cropTopPx = Math.max(0, Math.round((viewport.height - yTopPdf) * scale));
-      const cropBottomPx = Math.min(img.height, Math.round((viewport.height - yBottomPdf) * scale));
-      const cropHeightPx = cropBottomPx - cropTopPx;
-      if (cropHeightPx > 4) {
-        const cropCanvas = createCanvas(img.width, cropHeightPx);
-        const ctx = cropCanvas.getContext("2d");
-        ctx.drawImage(img, 0, cropTopPx, img.width, cropHeightPx, 0, 0, img.width, cropHeightPx);
-        targetBuffer = cropCanvas.toBuffer("image/png");
-      }
+      const viewport = page.getViewport({ scale });
+      // لازم نعمل الخطوة دي مرة واحدة قبل أي رسم يدوي بتاعنا إحنا (مش عن طريق
+      // دوال unpdf الجاهزة) — بتظبط شوية أوامر لازمة لمكتبة الرسم تشتغل في Node
+      await createIsomorphicCanvasFactory(() => import("@napi-rs/canvas"));
+      const cropTopPx = Math.max(0, Math.round((viewport1x.height - yTopPdf) * scale));
+      const cropBottomPx = Math.min(viewport.height, Math.round((viewport1x.height - yBottomPdf) * scale));
+      const cropHeightPx = Math.max(8, cropBottomPx - cropTopPx);
+
+      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(cropHeightPx));
+      const ctx = canvas.getContext("2d");
+      ctx.translate(0, -cropTopPx);
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      targetBuffer = canvas.toBuffer("image/png");
+    } else {
+      // لو ملقيناش مكان السطر بدقة (تصميم شهادة مختلف مثلًا)، منحاولش نصور الصفحة
+      // كاملة كحل بديل — ده كان بيسبب مشكلة خطيرة: قراءة صورة الصفحة كاملة بالـOCR
+      // أحيانًا بتاخد وقت طويل جدًا (شفنا حالات فضلت شغالة أكتر من 40 ثانية)، وطول
+      // الوقت ده كان بيقفل طابور المعالجة بالكامل ويأخر كل الملفات اللي وراه. أفضل
+      // بكتير نسيب الملف ده باسمه الأصلي (REPO/CRN) بدل ما نخاطر بتعليق الباقي كله.
+      console.log("[ocr] id=" + debugId + " step=no-anchor-skip");
+      return null;
     }
     console.log("[ocr] id=" + debugId + " step=rendered ms=" + (Date.now() - t0) + " cropped=" + !!anchor + " bytes=" + targetBuffer.length);
 
-    const { data: { text } } = await worker.recognize(targetBuffer);
+    // حماية إضافية: لو القراءة نفسها علّقت لأي سبب (حتى بعد القص)، نوقف الـworker
+    // بالقوة (terminate) بدل ما نسيبه معلق يقفل الطابور للأبد — وهنعمل واحد جديد
+    // بدل منه تلقائيًا في المرة الجاية.
+    const RECOGNIZE_TIMEOUT_MS = 15000;
+    let recognizeTimer;
+    const recognizePromise = worker.recognize(targetBuffer);
+    const timeoutPromise = new Promise((_, reject) => {
+      recognizeTimer = setTimeout(() => reject(new Error("recognize-timeout")), RECOGNIZE_TIMEOUT_MS);
+    });
+    let text;
+    try {
+      const result = await Promise.race([recognizePromise, timeoutPromise]);
+      text = result.data.text;
+    } catch (e) {
+      console.log("[ocr] id=" + debugId + " step=recognize-failed ms=" + (Date.now() - t0) + " error=" + (e && e.message));
+      // الـworker ممكن يكون لسه شغال جوه، نتخلص منه ونعمل واحد جديد بدل منه
+      worker.terminate().catch(() => {});
+      ocrWorkerPromise = null;
+      return null;
+    } finally {
+      clearTimeout(recognizeTimer);
+    }
     console.log("[ocr] id=" + debugId + " step=recognized ms=" + (Date.now() - t0) + " text=" + JSON.stringify(String(text || "").slice(0, 300)));
     return text ? extractPlateFromText(text) : null;
   });
