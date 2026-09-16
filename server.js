@@ -20,7 +20,9 @@ const express = require("express");
 const multer = require("multer");
 const XLSX = require("xlsx");
 const cors = require("cors");
-const { extractText, getDocumentProxy } = require("unpdf");
+const path = require("path");
+const { extractText, getDocumentProxy, renderPageAsImage } = require("unpdf");
+const { createWorker } = require("tesseract.js");
 
 const app = express();
 
@@ -50,10 +52,6 @@ app.get("/", (req, res) => {
 const CERT_DOWNLOAD_BASE = "https://osos-certificates.ososapp.workers.dev";
 const CERT_RESOLVE_MAX_IDS = 20; // سقف أمان لعدد الملفات في الطلب الواحد (كان 30 — قللناه)
 const CERT_RESOLVE_CONCURRENCY = 3; // كام ملف بيتفتح بالتوازي جوه نفس الطلب (كان 6 — قللناه عشان Render Free)
-
-// عداد مؤقت للتصحيح — بيتصفر مع كل إعادة تشغيل للسيرفر (Deploy جديد)
-let RAW_DEBUG_COUNT = 0;
-const RAW_DEBUG_LIMIT = 5;
 
 // فاصل مسموح بين حروف اللوحة أو بينها وبين الأرقام: مسافة أو شرطة (كان بس مسافة قبل كده)
 const SEP = "[\\s\\-]*";
@@ -113,6 +111,55 @@ function extractPlateFromText(text) {
   return null;
 }
 
+/* =================================================================
+ * OCR للعربي (حل أخير، بس للشهادات اللي فشل معاها استخراج النص العادي)
+ * -----------------------------------------------------------------
+ * المشكلة: الفونت العربي في الشهادات دي بيتحول لرموز عشوائية لما نحاول
+ * نقرأه كنص من جوه الـ PDF (مش مشكلة ترتيب أو مسافات، المشكلة في الفونت
+ * نفسه). الحل الوحيد الشغال: نحوّل الصفحة لصورة، ونشغّل عليها "قراءة
+ * ضوئية" (OCR) بالعربي — تمامًا زي ما العين البشرية بتقرا صورة.
+ *
+ * ده أبطأ بكتير من قراءة النص، فبنستخدمه كملاذ أخير بس، لما كل الطرق
+ * التانية (العنوان الصريح + الأنماط القديمة) تفشل تمامًا.
+ * ================================================================= */
+
+const OCR_LANG_PATH = path.join(__dirname, "node_modules", "@tesseract.js-data", "ara", "4.0.0_best_int");
+const OCR_RENDER_SCALE = 2.5; // كل ما زاد، وضحت الصورة أكتر لكن استخرج أبطأ وأتقل على الرام
+const OCR_TIMEOUT_MS = 45000; // 45 ثانية أقصى حد لعملية التصوير+القراءة الواحدة
+
+let ocrWorkerPromise = null;
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = createWorker("ara", 1, {
+      langPath: OCR_LANG_PATH,
+      gzip: true,
+      cacheMethod: "none"
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+// طابور بسيط بيضمن إن ملف واحد بس بيتعمل له OCR في نفس اللحظة — عشان
+// الاستخدام الكتير للمعالج (CPU) في نفس الوقت ممكن يوقع سيرفر Render الضعيف
+let ocrQueueTail = Promise.resolve();
+function runInOcrQueue(fn) {
+  const run = ocrQueueTail.then(fn, fn);
+  ocrQueueTail = run.catch(() => {}); // فشل ملف واحد متوقفش اللي بعده
+  return run;
+}
+
+async function ocrArabicPlate(pdf) {
+  return runInOcrQueue(async () => {
+    const worker = await getOcrWorker();
+    const imageBuffer = await renderPageAsImage(pdf, 1, {
+      canvasImport: () => import("@napi-rs/canvas"),
+      scale: OCR_RENDER_SCALE
+    });
+    const { data: { text } } = await worker.recognize(Buffer.from(imageBuffer));
+    return text ? extractPlateFromText(text) : null;
+  });
+}
+
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let idx = 0;
@@ -148,24 +195,18 @@ function withTimeout(promise, ms, fallbackValue) {
 async function resolveOnePlateRaw(id) {
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS);
+  let pdf = null;
   try {
     const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", { signal: controller.signal });
     if (!res.ok) return null;
     const buf = await res.arrayBuffer();
-    const pdf = await getDocumentProxy(new Uint8Array(buf));
+    pdf = await getDocumentProxy(new Uint8Array(buf));
     const { text } = await extractText(pdf, { mergePages: true });
-    const result = text ? extractPlateFromText(text) : null;
-    // تصحيح مؤقت (مرحلة 1): لو فشل الاستخراج تمامًا، نسجل جزء من النص الخام
+    let result = text ? extractPlateFromText(text) : null;
     if (!result) {
-      console.log("[plate-miss] id=" + id + " text=" + JSON.stringify(String(text || "").replace(/\s+/g, " ").slice(0, 600)));
-    }
-    // تصحيح مؤقت (مرحلة 2): أول 5 ملفات بس — نسجل النص الخام كامل كما هو (من غير
-    // أي تعديل) حتى لو الاستخراج نجح، عشان نشوف هل ترتيب/شكل الحروف العربي
-    // طالع سليم من مكتبة الاستخراج ولا معكوس — ده اللي هيوضحلنا سبب فشل
-    // "رقم اللوحة بالعربي" حتى لما بيكون موجود فعليًا في الشهادة
-    if (RAW_DEBUG_COUNT < RAW_DEBUG_LIMIT) {
-      RAW_DEBUG_COUNT++;
-      console.log("[plate-raw #" + RAW_DEBUG_COUNT + "] id=" + id + " result=" + JSON.stringify(result) + " text=" + JSON.stringify(String(text || "").slice(0, 1000)));
+      // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
+      // في الفونت نفسه)، فنحول الصفحة لصورة ونقراها بالعربي (OCR) بدل النص
+      result = await withTimeout(ocrArabicPlate(pdf), OCR_TIMEOUT_MS, null);
     }
     return result;
   } finally {
@@ -174,10 +215,11 @@ async function resolveOnePlateRaw(id) {
 }
 
 // طبقة حماية إضافية: حتى لو الـ fetch نجح بس استخراج النص نفسه علّق (ملف تالف مثلًا)،
-// بعد 15 ثانية بنعتبره فشل ونرجع null بدل ما نستنى للأبد
+// بعد المهلة القصوى (نص عادي + OCR لو احتاج) بنعتبره فشل ونرجع null بدل ما نستنى للأبد
+// المهلة هنا لازم تستحمل وقت الـ OCR كمان (لو احتجناه) مش بس وقت التنزيل والنص العادي
 async function resolveOnePlate(id) {
   try {
-    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS, null);
+    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS, null);
   } catch (e) {
     return null;
   }
