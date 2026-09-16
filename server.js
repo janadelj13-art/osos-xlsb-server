@@ -51,22 +51,58 @@ const CERT_DOWNLOAD_BASE = "https://osos-certificates.ososapp.workers.dev";
 const CERT_RESOLVE_MAX_IDS = 20; // سقف أمان لعدد الملفات في الطلب الواحد (كان 30 — قللناه)
 const CERT_RESOLVE_CONCURRENCY = 3; // كام ملف بيتفتح بالتوازي جوه نفس الطلب (كان 6 — قللناه عشان Render Free)
 
+// فاصل مسموح بين حروف اللوحة أو بينها وبين الأرقام: مسافة أو شرطة (كان بس مسافة قبل كده)
+const SEP = "[\\s\\-]*";
+
 // نفس ترتيب الأنماط اللي كانت شغالة في المتصفح، منقولة هنا بالظبط عشان النتيجة متطابقة
+// (دي طريقة احتياطية، بتتفتش لو الطريقة الأدق اللي تحت (بالعنوان) مالقتش حاجة)
 const CERT_PLATE_PATTERNS = [
-  { re: /((?:[\u0621-\u064A]\s*){3})(?![\u0621-\u064A])\s*(?:^|[^\d])(\d{4})(?!\d)/, lettersFirst: true },
-  { re: /(?:^|[^\d])(\d{4})(?!\d)\s*((?:[\u0621-\u064A]\s*){3})(?![\u0621-\u064A])/, lettersFirst: false },
-  { re: /(?:^|[^\d])(\d{4})(?!\d)\s*((?:[A-Za-z]\s*){3})(?![A-Za-z])/, lettersFirst: false },
-  // إضافة: كان ناقص شكل "حروف إنجليزي ثم أرقام" (زي AJS 9496) — الأنماط التلاتة الأصلية
-  // كانت بتغطي "عربي ثم أرقام" و"أرقام ثم عربي" و"أرقام ثم إنجليزي" بس، مش "إنجليزي ثم أرقام"
-  { re: /(?:^|[^A-Za-z])((?:[A-Za-z]\s*){3})(?![A-Za-z])\s*(?:^|[^\d])(\d{4})(?!\d)/, lettersFirst: true }
+  { re: new RegExp("((?:[\\u0621-\\u064A]" + SEP + "){3})(?![\\u0621-\\u064A])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true },
+  { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[\\u0621-\\u064A]" + SEP + "){3})(?![\\u0621-\\u064A])"), lettersFirst: false },
+  { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[A-Za-z]" + SEP + "){3})(?![A-Za-z])"), lettersFirst: false },
+  { re: new RegExp("(?:^|[^A-Za-z])((?:[A-Za-z]" + SEP + "){3})(?![A-Za-z])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true }
 ];
 
+// الطريقة الأدق: نلاقي عنوان الحقل نفسه ("رقم اللوحة باللغة العربية:" أو الإنجليزية)
+// ونفتش بس في الجزء اللي بعده مباشرة — عشان منتأثرش بأي نص تاني في الشهادة
+const AR_PLATE_LABEL = /رقم\s*اللوحة\s*باللغة\s*العربية\s*:?/;
+const EN_PLATE_LABEL = /رقم\s*اللوحة\s*باللغة\s*الإنجليزية\s*:?/;
+const LABEL_WINDOW = 60; // عدد الحروف اللي بنفتش فيها بعد العنوان مباشرة
+
+function grabPlateAfterLabel(text, labelRe, letterClass, stopRe) {
+  const m = text.match(labelRe);
+  if (!m) return null;
+  const start = m.index + m[0].length;
+  let end = start + LABEL_WINDOW;
+  // مهم: لو الحقل ده فاضي (مفيش رقم لوحة عربي مثلاً)، النص هيروح على طول لعنوان الحقل
+  // اللي بعده (زي "رقم اللوحة باللغة الإنجليزية:") — لازم نوقف قبله عشان منلخبطش
+  // ونفتكر إن كلمة "رقم" بتاعت العنوان التاني هي حروف اللوحة بالغلط
+  if (stopRe) {
+    const stopM = text.slice(start, end).match(stopRe);
+    if (stopM) end = start + stopM.index;
+  }
+  const windowText = text.slice(start, end);
+  const lettersRe = new RegExp("(?:[" + letterClass + "]" + SEP + "){3}(?![" + letterClass + "])");
+  const lettersMatch = windowText.match(lettersRe);
+  const digitsMatch = windowText.match(/(\d{4})(?!\d)/);
+  if (!lettersMatch || !digitsMatch) return null;
+  const letters = lettersMatch[0].replace(/[\s\-]+/g, "");
+  return letters + " " + digitsMatch[1];
+}
+
 function extractPlateFromText(text) {
+  // 1) جرب العنوان العربي الصريح (ولازم نوقف قبل عنوان الإنجليزي لو الحقل العربي فاضي)
+  const ar = grabPlateAfterLabel(text, AR_PLATE_LABEL, "\\u0621-\\u064A", EN_PLATE_LABEL);
+  if (ar) return ar;
+  // 2) لو مفيش، جرب العنوان الإنجليزي الصريح
+  const en = grabPlateAfterLabel(text, EN_PLATE_LABEL, "A-Za-z");
+  if (en) return en;
+  // 3) أخيرًا، الطريقة القديمة (فحص النص كله بدون الاعتماد على العنوان)
   for (let i = 0; i < CERT_PLATE_PATTERNS.length; i++) {
     const { re, lettersFirst } = CERT_PLATE_PATTERNS[i];
     const m = text.match(re);
     if (!m) continue;
-    const letters = (lettersFirst ? m[1] : m[2]).replace(/\s+/g, "");
+    const letters = (lettersFirst ? m[1] : m[2]).replace(/[\s\-]+/g, "");
     const digits = lettersFirst ? m[2] : m[1];
     if (digits && letters) return letters + " " + digits;
   }
@@ -114,7 +150,13 @@ async function resolveOnePlateRaw(id) {
     const buf = await res.arrayBuffer();
     const pdf = await getDocumentProxy(new Uint8Array(buf));
     const { text } = await extractText(pdf, { mergePages: true });
-    return text ? extractPlateFromText(text) : null;
+    const result = text ? extractPlateFromText(text) : null;
+    // تصحيح مؤقت: لو فشل الاستخراج، نسجل جزء من النص الخام في اللوجز
+    // عشان نقدر نلاقيه لاحقًا في Render > Logs بالبحث برقم اللوحة (مثلاً 9496)
+    if (!result) {
+      console.log("[plate-miss] id=" + id + " text=" + JSON.stringify(String(text || "").replace(/\s+/g, " ").slice(0, 600)));
+    }
+    return result;
   } finally {
     clearTimeout(abortTimer);
   }
