@@ -48,8 +48,8 @@ app.get("/", (req, res) => {
  * ================================================================= */
 
 const CERT_DOWNLOAD_BASE = "https://osos-certificates.ososapp.workers.dev";
-const CERT_RESOLVE_MAX_IDS = 30; // سقف أمان لعدد الملفات في الطلب الواحد
-const CERT_RESOLVE_CONCURRENCY = 6; // كام ملف بيتفتح بالتوازي جوه نفس الطلب
+const CERT_RESOLVE_MAX_IDS = 20; // سقف أمان لعدد الملفات في الطلب الواحد (كان 30 — قللناه)
+const CERT_RESOLVE_CONCURRENCY = 3; // كام ملف بيتفتح بالتوازي جوه نفس الطلب (كان 6 — قللناه عشان Render Free)
 
 // نفس ترتيب الأنماط اللي كانت شغالة في المتصفح، منقولة هنا بالظبط عشان النتيجة متطابقة
 const CERT_PLATE_PATTERNS = [
