@@ -61,7 +61,7 @@ const SEP = "[\\s\\-]*";
 // (دي طريقة احتياطية، بتتفتش لو الطريقة الأدق اللي تحت (بالعنوان) مالقتش حاجة)
 const CERT_PLATE_PATTERNS = [
   // العربي: {2,4} مش {3} بالظبط — مرونة لضوضاء الـOCR (حرف زيادة أو ناقص)
-  { re: new RegExp("((?:[\\u0621-\\u064A]" + SEP + "){2,4})(?![\\u0621-\\u064A])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true },
+  { re: new RegExp("(?<![\\u0621-\\u064A])((?:[\\u0621-\\u064A]" + SEP + "){2,4})(?![\\u0621-\\u064A])" + SEP + "(?:^|[^\\d])(\\d{4})(?!\\d)"), lettersFirst: true },
   { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[\\u0621-\\u064A]" + SEP + "){2,4})(?![\\u0621-\\u064A])"), lettersFirst: false },
   // الإنجليزي: فاضل {3} بالظبط لأنه من نص حقيقي مش OCR، دقيق أصلًا
   { re: new RegExp("(?:^|[^\\d])(\\d{4})(?!\\d)" + SEP + "((?:[A-Za-z]" + SEP + "){3})(?![A-Za-z])"), lettersFirst: false },
@@ -97,6 +97,26 @@ function grabPlateAfterLabel(text, labelRe, letterClass, stopRe) {
   return letters + " " + digitsMatch[1];
 }
 
+// شهادات "توثيق" (ARN / مستخرج السند التنفيذي): العنوان "رقم اللوحة:" والقيمة حروف منفصلة
+// بمسافات + من 1 لـ 4 أرقام، زي "أ ط ط 1637". مكتبة قراءة الـPDF أحيانًا بتطلّع كلمات العنوان
+// بالمقلوب ("أ ط ط 1637 :اللوحة رقم")، فبنجرب الشكلين. الحروف لازم تكون منفصلة (حرف حرف)
+// عشان منمسكش كلمة عادية من الشهادة بالغلط.
+const TW_LETTERS = "(?<![\\u0621-\\u064A])([\\u0621-\\u064A](?:[ \\t]+[\\u0621-\\u064A]){1,3})(?![\\u0621-\\u064A])";
+const TW_DIGITS = "(\\d{1,4})";
+const TAWTHEEQ_PATTERNS = [
+  { re: new RegExp(TW_LETTERS + "[ \\t]+" + TW_DIGITS + "\\s*:\\s*اللوحة\\s+رقم"), l: 1, d: 2 },
+  { re: new RegExp("(?<!\\d)" + TW_DIGITS + "[ \\t]+" + TW_LETTERS + "\\s*:\\s*اللوحة\\s+رقم"), l: 2, d: 1 },
+  { re: new RegExp("رقم\\s+اللوحة\\s*:[ \\t]*" + TW_LETTERS + "[ \\t]+" + TW_DIGITS + "(?!\\d)"), l: 1, d: 2 },
+  { re: new RegExp("رقم\\s+اللوحة\\s*:[ \\t]*" + TW_DIGITS + "[ \\t]+" + TW_LETTERS), l: 2, d: 1 },
+];
+function extractTawtheeqPlate(text) {
+  for (const p of TAWTHEEQ_PATTERNS) {
+    const m = text.match(p.re);
+    if (m) return m[p.l].replace(/\s+/g, "") + " " + m[p.d];
+  }
+  return null;
+}
+
 function extractPlateFromText(text) {
   // 1) جرب العنوان العربي الصريح (ولازم نوقف قبل عنوان الإنجليزي لو الحقل العربي فاضي)
   const ar = grabPlateAfterLabel(text, AR_PLATE_LABEL, "\\u0621-\\u064A", EN_PLATE_LABEL);
@@ -104,6 +124,9 @@ function extractPlateFromText(text) {
   // 2) لو مفيش، جرب العنوان الإنجليزي الصريح
   const en = grabPlateAfterLabel(text, EN_PLATE_LABEL, "A-Za-z");
   if (en) return en;
+  // 2.5) شهادات توثيق (ARN): "رقم اللوحة:" من غير "باللغة العربية"
+  const tw = extractTawtheeqPlate(text);
+  if (tw) return tw;
   // 3) أخيرًا، الطريقة القديمة (فحص النص كله بدون الاعتماد على العنوان)
   for (let i = 0; i < CERT_PLATE_PATTERNS.length; i++) {
     const { re, lettersFirst } = CERT_PLATE_PATTERNS[i];
