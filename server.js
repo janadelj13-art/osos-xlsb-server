@@ -268,6 +268,130 @@ async function ocrArabicPlate(pdf, debugId) {
   });
 }
 
+
+/* =================================================================
+ * اسم المؤجر (طالب التنفيذ) — عشان نعرف كل شهادة تبع أنهي شركة
+ * -----------------------------------------------------------------
+ * - توثيق (ARN): الاسم نص عادي مقروء → بنقراه مباشرة من النص.
+ * - سجل (REPO/CRN): الاسم العربي متشفّر، لكن رقم السجل التجاري للمؤجر أرقام
+ *   عادية → بنقراه سريع، ولو أول مرة نشوف الرقم ده بنعمل OCR لسطر الاسم بس
+ *   مرة واحدة ونحفظ (رقم السجل → الاسم) في الذاكرة، وكل شهادة بعدها بنفس الرقم
+ *   بتاخد الاسم من الذاكرة من غير OCR.
+ * ================================================================= */
+const lessorNameByCr = new Map();      // رقم السجل التجاري → اسم الشركة
+const lessorOcrPending = new Map();    // رقم السجل → Promise شغالة (عشان منكررش OCR لنفس الشركة)
+
+function cleanLessorName(s) {
+  if (!s) return null;
+  s = String(s)
+    .replace(/[\u064B-\u065F\u0670\u200E\u200F\u202A-\u202E]/g, "")
+    .replace(/اسم\s*المؤجر\s*:?/g, " ")
+    .replace(/الرقم\s*الوطني\s*الموحد|رقم\s*التواصل|رقم\s*الترخيص|رقم\s*السجل\s*التجاري|السجل\s*التجاري|المدينة|العنوان\s*الوطني/g, " ")
+    .replace(/[A-Za-z0-9\u0660-\u0669]/g, " ")
+    .replace(/[|:؛;_\[\]{}()<>«»"'`~^*=+\\\/\-.,،؟?!]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const arLetters = (s.match(/[\u0621-\u064A]/g) || []).length;
+  if (arLetters < 3 || s.length > 80) return null;
+  return s;
+}
+
+// توثيق: تحت "المؤجر (طالب التنفيذ)" في سطر "الاسم: ..." (بنجرب الشكلين: عادي ومقلوب)
+function extractTawtheeqLessor(text) {
+  if (!text) return null;
+  const m = text.match(/المؤجر\s*\(?\s*طالب\s*التنفيذ\s*\)?/);
+  const from = m ? m.index + m[0].length : text.search(/طالب\s*التنفيذ/);
+  if (from < 0) return null;
+  const win = text.slice(from, from + 400);
+  const STOP = /\s*(?::|\d|الرقم|رقم|المدينة|العنوان|التواصل|الترخيص|السجل|الصفة)/;
+  let mm = win.match(/(?:^|\s)الاسم\s*:\s*([^\n\r]+)/);
+  if (mm) {
+    const v = cleanLessorName(mm[1].split(STOP)[0]);
+    if (v) return v;
+  }
+  mm = win.match(/([^\n\r:]+?)\s*:\s*الاسم/);
+  if (mm) {
+    const v = cleanLessorName(mm[1]);
+    if (v) return v;
+  }
+  return null;
+}
+
+// سجل: أعلى رقم من 10 خانات في الصفحة (مش بيبدأ بـ 700 = الرقم الوطني الموحد) = السجل التجاري للمؤجر
+async function findLessorCrItem(pdf) {
+  const page = await pdf.getPage(1);
+  const content = await page.getTextContent();
+  let best = null;
+  for (const it of content.items) {
+    const str = it.str || "";
+    const m = str.match(/(?<![\d\-])(\d{10})(?!\d)/);
+    if (!m || /^700/.test(m[1])) continue;
+    const y = it.transform[5];
+    if (!best || y > best.y) best = { it, cr: m[1], y };
+  }
+  return { page, best };
+}
+
+// OCR لسطر اسم المؤجر بس (فوق سطر السجل التجاري مباشرة، تحت عنوان "طالب التنفيذ")
+async function ocrLessorName(page, crItem, debugId) {
+  return runInOcrQueue(async () => {
+    const worker = await getOcrWorker();
+    const viewport1x = page.getViewport({ scale: 1.0 });
+    const scale = OCR_RENDER_SCALE;
+    const fontSize = Math.abs(crItem.height || crItem.transform[0]) || 10;
+    const yb = crItem.transform[5];
+    const yTopPdf = yb + fontSize * 3.3;
+    const yBottomPdf = yb + fontSize * 1.1;
+    const viewport = page.getViewport({ scale });
+    await createIsomorphicCanvasFactory(() => import("@napi-rs/canvas"));
+    const cropTopPx = Math.max(0, Math.round((viewport1x.height - yTopPdf) * scale));
+    const cropBottomPx = Math.min(viewport.height, Math.round((viewport1x.height - yBottomPdf) * scale));
+    const cropHeightPx = Math.max(8, cropBottomPx - cropTopPx);
+    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(cropHeightPx));
+    const ctx = canvas.getContext("2d");
+    ctx.translate(0, -cropTopPx);
+    await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+    const buf = canvas.toBuffer("image/png");
+
+    let timer;
+    try {
+      const result = await Promise.race([
+        worker.recognize(buf),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("recognize-timeout")), 15000); })
+      ]);
+      const name = cleanLessorName(result.data.text);
+      console.log("[lessor] id=" + debugId + " ocr=" + JSON.stringify(String(result.data.text || "").slice(0, 120)) + " -> " + JSON.stringify(name));
+      return name;
+    } catch (e) {
+      worker.terminate().catch(() => {});
+      ocrWorkerPromise = null;
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+}
+
+// بيرجّع { name, cr } أو null
+async function resolveLessor(pdf, text, id) {
+  const tw = extractTawtheeqLessor(text);
+  if (tw) return { name: tw, cr: null };
+  const { page, best } = await findLessorCrItem(pdf);
+  if (!best) return null;
+  let name = lessorNameByCr.get(best.cr) || null;
+  if (!name) {
+    let pending = lessorOcrPending.get(best.cr);
+    if (!pending) {
+      pending = ocrLessorName(page, best.it, id)
+        .then((n) => { if (n) lessorNameByCr.set(best.cr, n); return n; })
+        .finally(() => lessorOcrPending.delete(best.cr));
+      lessorOcrPending.set(best.cr, pending);
+    }
+    name = await withTimeout(pending, OCR_TIMEOUT_MS, null);
+  }
+  return { name: name || null, cr: best.cr };
+}
+
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let idx = 0;
@@ -316,7 +440,10 @@ async function resolveOnePlateRaw(id) {
       // في الفونت نفسه)، فنحول الصفحة لصورة ونقراها بالعربي (OCR) بدل النص
       result = await withTimeout(ocrArabicPlate(pdf, id), OCR_TIMEOUT_MS, null);
     }
-    return result;
+    // اسم المؤجر (طالب التنفيذ) — فشله مايأثرش على رقم اللوحة
+    let lessor = null;
+    try { lessor = await resolveLessor(pdf, text || "", id); } catch (e) { lessor = null; }
+    return { plate: result, lessor };
   } finally {
     clearTimeout(abortTimer);
   }
@@ -327,14 +454,14 @@ async function resolveOnePlateRaw(id) {
 // المهلة هنا لازم تستحمل وقت الـ OCR كمان (لو احتجناه) مش بس وقت التنزيل والنص العادي
 async function resolveOnePlate(id) {
   try {
-    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS, null);
+    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS * 2, null);
   } catch (e) {
     return null;
   }
 }
 
 // جسم الطلب: { ids: ["driveFileId1", "driveFileId2", ...] }
-// الرد: { ok:true, results: { "driveFileId1": "AJS 9496" | null, ... } }
+// الرد: { ok:true, results: { "driveFileId1": "AJS 9496" | null, ... }, lessors: { "driveFileId1": {name, cr} | null } }
 app.post("/api/certificates/resolve-plates", async (req, res) => {
   try {
     const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
@@ -342,12 +469,17 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
     if (!cleanIds.length) return res.status(400).json({ ok: false, error: "لا يوجد ids" });
 
     const results = {};
+    const lessors = {};
     await mapWithConcurrency(cleanIds, CERT_RESOLVE_CONCURRENCY, async (id) => {
-      try { results[id] = await resolveOnePlate(id); }
-      catch (e) { results[id] = null; }
+      try {
+        const r = await resolveOnePlate(id);
+        results[id] = r ? r.plate : null;
+        lessors[id] = r ? r.lessor : null;
+      } catch (e) { results[id] = null; lessors[id] = null; }
     });
 
-    res.json({ ok: true, results });
+    // lessors: { id: { name: "شركة ..." | null, cr: "4030206631" | null } | null }
+    res.json({ ok: true, results, lessors });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
