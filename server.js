@@ -286,6 +286,7 @@ function cleanLessorName(s) {
   s = String(s)
     .replace(/[\u064B-\u065F\u0670\u200E\u200F\u202A-\u202E]/g, "")
     .replace(/اسم\s*المؤجر\s*:?/g, " ")
+    .replace(/(^|\s)الاسم(?=\s|$|:)/g, " ")
     .replace(/الرقم\s*الوطني\s*الموحد|رقم\s*التواصل|رقم\s*الترخيص|رقم\s*السجل\s*التجاري|السجل\s*التجاري|المدينة|العنوان\s*الوطني/g, " ")
     .replace(/[A-Za-z0-9\u0660-\u0669]/g, " ")
     .replace(/[|:؛;_\[\]{}()<>«»"'`~^*=+\\\/\-.,،؟?!]/g, " ")
@@ -317,39 +318,74 @@ function extractTawtheeqLessor(text) {
   return null;
 }
 
-// سجل: أعلى رقم من 10 خانات في الصفحة (مش بيبدأ بـ 700 = الرقم الوطني الموحد) = السجل التجاري للمؤجر
-async function findLessorCrItem(pdf) {
+// بيحسب مكان اسم المؤجر في الصفحة (من مواضع عناصر النص، مش من ترتيب النص):
+// - توثيق: تحت عنوان "المؤجر (طالب التنفيذ)" أول سطر "الاسم" — بنقص السطر ده من النص الأيمن للصفحة
+// - سجل: فوق سطر السجل التجاري للمؤجر مباشرة (أعلى رقم من 10 خانات مش بيبدأ بـ 700)
+// بيرجّع { page, cr, band: { yTop, yBottom, x0 } | null, kind }
+async function locateLessor(pdf) {
   const page = await pdf.getPage(1);
   const content = await page.getTextContent();
-  let best = null;
-  for (const it of content.items) {
-    const str = it.str || "";
-    const m = str.match(/(?<![\d\-])(\d{10})(?!\d)/);
+  const W = page.getViewport({ scale: 1.0 }).width;
+  const items = content.items.filter((it) => it.str && it.str.trim());
+
+  let crBest = null;
+  for (const it of items) {
+    const m = it.str.match(/(?<![\d\-])(\d{10})(?!\d)/);
     if (!m || /^700/.test(m[1])) continue;
     const y = it.transform[5];
-    if (!best || y > best.y) best = { it, cr: m[1], y };
+    if (!crBest || y > crBest.y) crBest = { it, cr: m[1], y };
   }
-  return { page, best };
+
+  // توثيق؟
+  let header = null;
+  for (const it of items) {
+    if (!/(?:طالب\s*التنفيذ|التنفيذ\s*طالب)/.test(it.str)) continue;
+    const y = it.transform[5];
+    if (!header || y > header.transform[5]) header = it;
+  }
+  if (header) {
+    const hy = header.transform[5];
+    let label = null;
+    for (const it of items) {
+      if (!/الاسم/.test(it.str)) continue;
+      const y = it.transform[5];
+      if (y < hy - 2 && (!label || y > label.transform[5])) label = it;
+    }
+    if (label) {
+      const f = Math.abs(label.height || label.transform[0]) || 10;
+      const ly = label.transform[5];
+      return { page, items, cr: crBest ? crBest.cr : null, kind: "tawtheeq",
+               band: { yTop: ly + f * 1.1, yBottom: ly - f * 0.5, x0: W * 0.4 } };
+    }
+  }
+  // سجل
+  if (crBest) {
+    const f = Math.abs(crBest.it.height || crBest.it.transform[0]) || 10;
+    const yb = crBest.it.transform[5];
+    return { page, items, cr: crBest.cr, kind: "sijil",
+             band: { yTop: yb + f * 3.3, yBottom: yb + f * 1.1, x0: 0 } };
+  }
+  return { page, items, cr: null, band: null, kind: null };
 }
 
-// OCR لسطر اسم المؤجر بس (فوق سطر السجل التجاري مباشرة، تحت عنوان "طالب التنفيذ")
-async function ocrLessorName(page, crItem, debugId) {
+// OCR لشريط صغير من الصفحة (سطر اسم المؤجر بس)
+async function ocrBand(page, band, debugId) {
   return runInOcrQueue(async () => {
     const worker = await getOcrWorker();
     const viewport1x = page.getViewport({ scale: 1.0 });
     const scale = OCR_RENDER_SCALE;
-    const fontSize = Math.abs(crItem.height || crItem.transform[0]) || 10;
-    const yb = crItem.transform[5];
-    const yTopPdf = yb + fontSize * 3.3;
-    const yBottomPdf = yb + fontSize * 1.1;
     const viewport = page.getViewport({ scale });
     await createIsomorphicCanvasFactory(() => import("@napi-rs/canvas"));
-    const cropTopPx = Math.max(0, Math.round((viewport1x.height - yTopPdf) * scale));
-    const cropBottomPx = Math.min(viewport.height, Math.round((viewport1x.height - yBottomPdf) * scale));
+    const x0px = Math.max(0, Math.round((band.x0 || 0) * scale));
+    const cropTopPx = Math.max(0, Math.round((viewport1x.height - band.yTop) * scale));
+    const cropBottomPx = Math.min(viewport.height, Math.round((viewport1x.height - band.yBottom) * scale));
     const cropHeightPx = Math.max(8, cropBottomPx - cropTopPx);
-    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(cropHeightPx));
+    const cropWidthPx = Math.max(8, Math.ceil(viewport.width) - x0px);
+    const canvas = createCanvas(cropWidthPx, Math.ceil(cropHeightPx));
     const ctx = canvas.getContext("2d");
-    ctx.translate(0, -cropTopPx);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cropWidthPx, Math.ceil(cropHeightPx));
+    ctx.translate(-x0px, -cropTopPx);
     await page.render({ canvas, canvasContext: ctx, viewport }).promise;
     const buf = canvas.toBuffer("image/png");
 
@@ -359,10 +395,12 @@ async function ocrLessorName(page, crItem, debugId) {
         worker.recognize(buf),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("recognize-timeout")), 15000); })
       ]);
-      const name = cleanLessorName(result.data.text);
-      console.log("[lessor] id=" + debugId + " ocr=" + JSON.stringify(String(result.data.text || "").slice(0, 120)) + " -> " + JSON.stringify(name));
+      const raw = String(result.data.text || "");
+      const name = cleanLessorName(raw);
+      console.log("[lessor] id=" + debugId + " ocr=" + JSON.stringify(raw.slice(0, 120)) + " -> " + JSON.stringify(name));
       return name;
     } catch (e) {
+      console.log("[lessor] id=" + debugId + " ocr-failed " + (e && e.message));
       worker.terminate().catch(() => {});
       ocrWorkerPromise = null;
       return null;
@@ -374,22 +412,26 @@ async function ocrLessorName(page, crItem, debugId) {
 
 // بيرجّع { name, cr } أو null
 async function resolveLessor(pdf, text, id) {
-  const tw = extractTawtheeqLessor(text);
-  if (tw) return { name: tw, cr: null };
-  const { page, best } = await findLessorCrItem(pdf);
-  if (!best) return null;
-  let name = lessorNameByCr.get(best.cr) || null;
-  if (!name) {
-    let pending = lessorOcrPending.get(best.cr);
-    if (!pending) {
-      pending = ocrLessorName(page, best.it, id)
-        .then((n) => { if (n) lessorNameByCr.set(best.cr, n); return n; })
-        .finally(() => lessorOcrPending.delete(best.cr));
-      lessorOcrPending.set(best.cr, pending);
+  const loc = await locateLessor(pdf);
+  let name = loc.cr ? (lessorNameByCr.get(loc.cr) || null) : null;
+  if (!name && loc.band) {
+    const run = () => ocrBand(loc.page, loc.band, id);
+    if (loc.cr) {
+      let pending = lessorOcrPending.get(loc.cr);
+      if (!pending) {
+        pending = run()
+          .then((n) => { if (n) lessorNameByCr.set(loc.cr, n); return n; })
+          .finally(() => lessorOcrPending.delete(loc.cr));
+        lessorOcrPending.set(loc.cr, pending);
+      }
+      name = await withTimeout(pending, OCR_TIMEOUT_MS, null);
+    } else {
+      name = await withTimeout(run(), OCR_TIMEOUT_MS, null);
     }
-    name = await withTimeout(pending, OCR_TIMEOUT_MS, null);
   }
-  return { name: name || null, cr: best.cr };
+  if (!name && loc.kind !== "sijil") name = extractTawtheeqLessor(text); // احتياطي أخير (من النص)
+  if (!name && !loc.cr) return null;
+  return { name: name || null, cr: loc.cr || null };
 }
 
 async function mapWithConcurrency(items, limit, fn) {
@@ -479,7 +521,29 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
     });
 
     // lessors: { id: { name: "شركة ..." | null, cr: "4030206631" | null } | null }
-    res.json({ ok: true, results, lessors });
+    res.json({ ok: true, v: 2, results, lessors });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
+});
+
+// تشخيص: افتح الرابط ده في المتصفح (حط id شهادة) وابعتلي الناتج لو أسماء الشركات مش طالعة
+// GET /api/certificates/debug-lessor?id=DRIVE_FILE_ID
+app.get("/api/certificates/debug-lessor", async (req, res) => {
+  try {
+    const id = String(req.query.id || "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "id مطلوب" });
+    const r = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download");
+    if (!r.ok) return res.status(502).json({ ok: false, error: "HTTP " + r.status });
+    const pdf = await getDocumentProxy(new Uint8Array(await r.arrayBuffer()));
+    const { text } = await extractText(pdf, { mergePages: true });
+    const loc = await locateLessor(pdf);
+    const bandItems = loc.band
+      ? loc.items.filter((it) => it.transform[5] <= loc.band.yTop + 6 && it.transform[5] >= loc.band.yBottom - 6)
+          .map((it) => ({ str: it.str, x: Math.round(it.transform[4]), y: Math.round(it.transform[5]) }))
+      : [];
+    const lessor = await resolveLessor(pdf, text || "", id);
+    res.json({ ok: true, kind: loc.kind, cr: loc.cr, band: loc.band, bandItems, lessor });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
