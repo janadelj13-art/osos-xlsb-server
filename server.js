@@ -466,7 +466,7 @@ function withTimeout(promise, ms, fallbackValue) {
   });
 }
 
-async function resolveOnePlateRaw(id) {
+async function resolveOnePlateRaw(id, mode) {
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS);
   let pdf = null;
@@ -476,15 +476,17 @@ async function resolveOnePlateRaw(id) {
     const buf = await res.arrayBuffer();
     pdf = await getDocumentProxy(new Uint8Array(buf));
     const { text } = await extractText(pdf, { mergePages: true });
-    let result = text ? extractPlateFromText(text) : null;
-    if (!result) {
+    const wantPlate = mode !== "lessor";   // mode: "lessor" = أسماء الشركات بس | "plate" = أرقام اللوحات بس | غير كده = الاتنين
+    const wantLessor = mode !== "plate";
+    let result = (wantPlate && text) ? extractPlateFromText(text) : null;
+    if (wantPlate && !result) {
       // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
       // في الفونت نفسه)، فنحول الصفحة لصورة ونقراها بالعربي (OCR) بدل النص
       result = await withTimeout(ocrArabicPlate(pdf, id), OCR_TIMEOUT_MS, null);
     }
     // اسم المؤجر (طالب التنفيذ) — فشله مايأثرش على رقم اللوحة
     let lessor = null;
-    try { lessor = await resolveLessor(pdf, text || "", id); } catch (e) { lessor = null; }
+    if (wantLessor) { try { lessor = await resolveLessor(pdf, text || "", id); } catch (e) { lessor = null; } }
     return { plate: result, lessor };
   } finally {
     clearTimeout(abortTimer);
@@ -494,9 +496,9 @@ async function resolveOnePlateRaw(id) {
 // طبقة حماية إضافية: حتى لو الـ fetch نجح بس استخراج النص نفسه علّق (ملف تالف مثلًا)،
 // بعد المهلة القصوى (نص عادي + OCR لو احتاج) بنعتبره فشل ونرجع null بدل ما نستنى للأبد
 // المهلة هنا لازم تستحمل وقت الـ OCR كمان (لو احتجناه) مش بس وقت التنزيل والنص العادي
-async function resolveOnePlate(id) {
+async function resolveOnePlate(id, mode) {
   try {
-    return await withTimeout(resolveOnePlateRaw(id), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS * 2, null);
+    return await withTimeout(resolveOnePlateRaw(id, mode), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS * 2, null);
   } catch (e) {
     return null;
   }
@@ -510,11 +512,12 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
     const cleanIds = Array.from(new Set(ids.filter((x) => typeof x === "string" && x.trim()))).slice(0, CERT_RESOLVE_MAX_IDS);
     if (!cleanIds.length) return res.status(400).json({ ok: false, error: "لا يوجد ids" });
 
+    const mode = (req.body && typeof req.body.mode === "string") ? req.body.mode : "both";
     const results = {};
     const lessors = {};
     await mapWithConcurrency(cleanIds, CERT_RESOLVE_CONCURRENCY, async (id) => {
       try {
-        const r = await resolveOnePlate(id);
+        const r = await resolveOnePlate(id, mode);
         results[id] = r ? r.plate : null;
         lessors[id] = r ? r.lessor : null;
       } catch (e) { results[id] = null; lessors[id] = null; }
