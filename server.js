@@ -46,8 +46,10 @@ app.get("/", (req, res) => {
  * -----------------------------------------------------------------
  * الفكرة: الموبايل بيبعتلنا هنا بس IDs بتاعة الملفات، إحنا بنجيب كل PDF
  * من نفس رابط التنزيل الموجود أصلًا في Worker الشهادات (osos-certificates)
- * — من غير ما نحتاج أي توكنز Google جديدة هنا خالص — وبعدين نستخرج النص
- * ونلاقي فيه رقم اللوحة، ونرجّع النتيجة الجاهزة.
+ * وبعدين نستخرج النص ونلاقي فيه رقم اللوحة، ونرجّع النتيجة الجاهزة.
+ *
+ * مهم: الـ Worker مقفول ومحتاج إثبات دخول Firebase، فالموقع بيبعت التوكن في
+ * هيدر Authorization وإحنا بنمرره زي ما هو للـ Worker عند تنزيل كل PDF.
  * ================================================================= */
 
 const CERT_DOWNLOAD_BASE = "https://osos-certificates.ososapp.workers.dev";
@@ -466,13 +468,17 @@ function withTimeout(promise, ms, fallbackValue) {
   });
 }
 
-async function resolveOnePlateRaw(id, mode) {
+// authHeader: هيدر Authorization اللي جه من الموقع (Bearer توكن Firebase) — بنمرره زي ما هو للـ Worker
+async function resolveOnePlateRaw(id, mode, authHeader) {
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS);
   let pdf = null;
   try {
-    const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", { signal: controller.signal });
-    if (!res.ok) return null;
+    const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", {
+      signal: controller.signal,
+      headers: authHeader ? { Authorization: authHeader } : {}
+    });
+    if (!res.ok) return { plate: null, lessor: null, error: "download HTTP " + res.status };
     const buf = await res.arrayBuffer();
     pdf = await getDocumentProxy(new Uint8Array(buf));
     const { text } = await extractText(pdf, { mergePages: true });
@@ -496,16 +502,16 @@ async function resolveOnePlateRaw(id, mode) {
 // طبقة حماية إضافية: حتى لو الـ fetch نجح بس استخراج النص نفسه علّق (ملف تالف مثلًا)،
 // بعد المهلة القصوى (نص عادي + OCR لو احتاج) بنعتبره فشل ونرجع null بدل ما نستنى للأبد
 // المهلة هنا لازم تستحمل وقت الـ OCR كمان (لو احتجناه) مش بس وقت التنزيل والنص العادي
-async function resolveOnePlate(id, mode) {
+async function resolveOnePlate(id, mode, authHeader) {
   try {
-    return await withTimeout(resolveOnePlateRaw(id, mode), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS * 2, null);
+    return await withTimeout(resolveOnePlateRaw(id, mode, authHeader), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + OCR_TIMEOUT_MS * 2, null);
   } catch (e) {
     return null;
   }
 }
 
 // جسم الطلب: { ids: ["driveFileId1", "driveFileId2", ...] }
-// الرد: { ok:true, results: { "driveFileId1": "AJS 9496" | null, ... }, lessors: { "driveFileId1": {name, cr} | null } }
+// الرد: { ok:true, results: { "driveFileId1": "AJS 9496" | null, ... }, lessors: { "driveFileId1": {name, cr} | null }, errors: { id: "سبب الفشل" } }
 app.post("/api/certificates/resolve-plates", async (req, res) => {
   try {
     const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
@@ -513,18 +519,21 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
     if (!cleanIds.length) return res.status(400).json({ ok: false, error: "لا يوجد ids" });
 
     const mode = (req.body && typeof req.body.mode === "string") ? req.body.mode : "both";
+    const authHeader = req.headers.authorization || "";
     const results = {};
     const lessors = {};
+    const errors = {};
     await mapWithConcurrency(cleanIds, CERT_RESOLVE_CONCURRENCY, async (id) => {
       try {
-        const r = await resolveOnePlate(id, mode);
+        const r = await resolveOnePlate(id, mode, authHeader);
         results[id] = r ? r.plate : null;
         lessors[id] = r ? r.lessor : null;
+        if (r && r.error) errors[id] = r.error;
       } catch (e) { results[id] = null; lessors[id] = null; }
     });
 
     // lessors: { id: { name: "شركة ..." | null, cr: "4030206631" | null } | null }
-    res.json({ ok: true, v: 2, results, lessors });
+    res.json({ ok: true, v: 2, results, lessors, errors });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
   }
@@ -536,7 +545,10 @@ app.get("/api/certificates/debug-lessor", async (req, res) => {
   try {
     const id = String(req.query.id || "").trim();
     if (!id) return res.status(400).json({ ok: false, error: "id مطلوب" });
-    const r = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download");
+    const authHeader = req.headers.authorization || "";
+    const r = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", {
+      headers: authHeader ? { Authorization: authHeader } : {}
+    });
     if (!r.ok) return res.status(502).json({ ok: false, error: "HTTP " + r.status });
     const pdf = await getDocumentProxy(new Uint8Array(await r.arrayBuffer()));
     const { text } = await extractText(pdf, { mergePages: true });
