@@ -529,9 +529,15 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
         results[id] = r ? r.plate : null;
         lessors[id] = r ? r.lessor : null;
         if (r && r.error) errors[id] = r.error;
-      } catch (e) { results[id] = null; lessors[id] = null; }
+      } catch (e) { results[id] = null; lessors[id] = null; errors[id] = "exception: " + String((e && e.message) || e).slice(0, 80); }
     });
 
+    // تشخيص (بدون أي محتوى ملفات): عدد الملفات، هل جه توكن، كام لوحة اتقرت، وأسباب الفشل
+    try {
+      const okCount = cleanIds.filter((i) => results[i]).length;
+      console.log("[resolve] n=" + cleanIds.length + " mode=" + mode + " hasAuth=" + !!authHeader +
+        " plates=" + okCount + " errors=" + JSON.stringify(errors).slice(0, 300));
+    } catch (_) {}
     // lessors: { id: { name: "شركة ..." | null, cr: "4030206631" | null } | null }
     res.json({ ok: true, v: 2, results, lessors, errors });
   } catch (e) {
