@@ -99,6 +99,26 @@ function grabPlateAfterLabel(text, labelRe, letterClass, stopRe) {
   return letters + " " + digitsMatch[1];
 }
 
+// الحقل الإنجليزي: ساعات بيبقى مكتوب فيه "None" (مفيش لوحة إنجليزي) — ده مش لوحة، ولازم نتجاهله
+// ونرجع للعربي. كمان مبنمسكش حروف وأرقام من الحقل اللي بعده (زي رقم الهيكل VIN) لأن الحروف والأرقام
+// لازم يكونوا ملزوقين في بعض (3 حروف إنجليزي + 4 أرقام، بأي ترتيب).
+const EN_FIELD_STOP = /رقم\s*الهيكل|لون\s*المركبة|نوع\s*المركبة|المصنع/;
+function grabEnglishPlateAfterLabel(text) {
+  const m = text.match(EN_PLATE_LABEL);
+  if (!m) return null;
+  const start = m.index + m[0].length;
+  let win = text.slice(start, start + LABEL_WINDOW);
+  const stopM = win.match(EN_FIELD_STOP);
+  if (stopM) win = win.slice(0, stopM.index);
+  win = win.replace(/\b(?:none|null|nil|n\/a)\b/gi, " ");
+  const L3 = "((?:[A-Za-z][\\s\\-]*){3})(?![A-Za-z])";
+  let r = win.match(new RegExp("(?<!\\d)(\\d{4})(?!\\d)[\\s\\-]*(?<![A-Za-z])" + L3));
+  if (r) return r[2].replace(/[\s\-]+/g, "") + " " + r[1];
+  r = win.match(new RegExp("(?<![A-Za-z])" + L3 + "[\\s\\-]*(?<!\\d)(\\d{4})(?!\\d)"));
+  if (r) return r[1].replace(/[\s\-]+/g, "") + " " + r[2];
+  return null;
+}
+
 // شهادات "توثيق" (ARN / مستخرج السند التنفيذي): العنوان "رقم اللوحة:" والقيمة حروف منفصلة
 // بمسافات + من 1 لـ 4 أرقام، زي "أ ط ط 1637". مكتبة قراءة الـPDF أحيانًا بتطلّع كلمات العنوان
 // بالمقلوب ("أ ط ط 1637 :اللوحة رقم")، فبنجرب الشكلين. الحروف لازم تكون منفصلة (حرف حرف)
@@ -123,8 +143,8 @@ function extractPlateFromText(text) {
   // 1) جرب العنوان العربي الصريح (ولازم نوقف قبل عنوان الإنجليزي لو الحقل العربي فاضي)
   const ar = grabPlateAfterLabel(text, AR_PLATE_LABEL, "\\u0621-\\u064A", EN_PLATE_LABEL);
   if (ar) return ar;
-  // 2) لو مفيش، جرب العنوان الإنجليزي الصريح
-  const en = grabPlateAfterLabel(text, EN_PLATE_LABEL, "A-Za-z");
+  // 2) لو مفيش، جرب العنوان الإنجليزي الصريح (بيتجاهل "None" وأي قيمة فاضية، ولازم الحروف والأرقام يكونوا ملزوقين في بعض)
+  const en = grabEnglishPlateAfterLabel(text);
   if (en) return en;
   // 2.5) شهادات توثيق (ARN): "رقم اللوحة:" من غير "باللغة العربية"
   const tw = extractTawtheeqPlate(text);
@@ -415,7 +435,10 @@ async function ocrBand(page, band, debugId) {
 // بيرجّع { name, cr } أو null
 async function resolveLessor(pdf, text, id) {
   const loc = await locateLessor(pdf);
-  let name = loc.cr ? (lessorNameByCr.get(loc.cr) || null) : null;
+  // شهادات توثيق: الاسم نص عادي مقروء → نقراه مباشرة من النص (أسرع وأدق من OCR، ومن غير ما نخمّن رقم السجل)
+  let name = null;
+  if (loc.kind === "tawtheeq") name = extractTawtheeqLessor(text);
+  if (!name) name = loc.cr ? (lessorNameByCr.get(loc.cr) || null) : null;
   if (!name && loc.band) {
     const run = () => ocrBand(loc.page, loc.band, id);
     if (loc.cr) {
@@ -476,7 +499,7 @@ async function resolveOnePlateRaw(id, mode, authHeader) {
   try {
     const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", {
       signal: controller.signal,
-      headers: authHeader ? { Authorization: authHeader } : {}
+      headers: (authHeader && typeof authHeader === "object") ? authHeader : (authHeader ? { Authorization: authHeader } : {})
     });
     if (!res.ok) return { plate: null, lessor: null, error: "download HTTP " + res.status };
     const buf = await res.arrayBuffer();
@@ -542,6 +565,149 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
     res.json({ ok: true, v: 2, results, lessors, errors });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
+});
+
+
+/* ============================================================
+   استخراج تلقائي بالليل (من غير ما حد يفتح التطبيق)
+   - Worker الشهادات بينده على POST /api/certificates/auto-run كل 5 دقايق بمفتاح سري (SERVER_KEY)
+   - السيرفر بيجيب الشهادات الجديدة، يستخرج لوحاتها وأسماء مؤجريها، ويحفظ النتايج في Firestore
+     (collection: certMetaDay ، مستند لكل يوم) والتطبيق بيقراها أول ما يفتح
+   - لو SERVER_KEY مش متضاف في Variables: الـ endpoint مقفول تمامًا
+   ============================================================ */
+const crypto = require("crypto");
+const SERVER_KEY = process.env.SERVER_KEY || "";
+const FS_PROJECT = process.env.FIRESTORE_PROJECT || "jta-cloud-daeb1";
+const FS_BASE = "https://firestore.googleapis.com/v1/projects/" + FS_PROJECT + "/databases/(default)/documents/certMetaDay/";
+const AUTO_HOURS = 72;          // بنراجع آخر 72 ساعة
+const AUTO_MAX_PER_RUN = 120;   // أقصى عدد شهادات في الجولة الواحدة (الباقي في الجولة اللي بعدها)
+const AUTO_BUDGET_MS = 200000;  // نوقف قبل مهلة الطلب
+const AUTO_MAX_ATTEMPTS = 3;
+let autoRunning = false;
+let gcpTok = { v: "", exp: 0 };
+
+function keyEq(a, b) {
+  const x = crypto.createHash("sha256").update(String(a)).digest();
+  const y = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
+}
+
+async function gcpToken() {
+  if (gcpTok.v && Date.now() < gcpTok.exp) return gcpTok.v;
+  const r = await fetch("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", { headers: { "Metadata-Flavor": "Google" } });
+  if (!r.ok) throw new Error("metadata token HTTP " + r.status);
+  const d = await r.json();
+  gcpTok = { v: d.access_token, exp: Date.now() + Math.max(60, (d.expires_in || 600) - 120) * 1000 };
+  return gcpTok.v;
+}
+
+function dayOf(f) {
+  const t = Date.parse(f.createdTime || f.modifiedTime || "");
+  return new Date(isNaN(t) ? Date.now() : t).toISOString().slice(0, 10); // يوم UTC
+}
+
+// بيرجع { id: { p, l, c, a } } لليوم ده
+async function fsGetDay(day) {
+  const r = await fetch(FS_BASE + day, { headers: { Authorization: "Bearer " + (await gcpToken()) } });
+  if (r.status === 404) return {};
+  if (!r.ok) throw new Error("firestore get HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+  const d = await r.json();
+  const m = (((d.fields || {}).m || {}).mapValue || {}).fields || {};
+  const out = {};
+  for (const id of Object.keys(m)) {
+    const f = ((m[id] || {}).mapValue || {}).fields || {};
+    out[id] = {
+      p: (f.p && f.p.stringValue) || "",
+      l: (f.l && f.l.stringValue) || "",
+      c: (f.c && f.c.stringValue) || "",
+      a: Number((f.a && f.a.integerValue) || 0)
+    };
+  }
+  return out;
+}
+
+async function fsSaveDay(day, entries) {
+  const ids = Object.keys(entries);
+  if (!ids.length) return;
+  const fields = {};
+  for (const id of ids) {
+    const e = entries[id];
+    fields[id] = { mapValue: { fields: {
+      p: { stringValue: e.p || "" },
+      l: { stringValue: e.l || "" },
+      c: { stringValue: e.c || "" },
+      a: { integerValue: String(e.a || 0) }
+    } } };
+  }
+  const mask = ids.map((id) => "updateMask.fieldPaths=" + encodeURIComponent("m.`" + id.replace(/`/g, "") + "`")).join("&");
+  const r = await fetch(FS_BASE + day + "?" + mask, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: { m: { mapValue: { fields } } } })
+  });
+  if (!r.ok) throw new Error("firestore save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+}
+
+async function autoRunOnce() {
+  const t0 = Date.now();
+  const serverHdr = { "X-Server-Key": SERVER_KEY };
+  const lr = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/recent?hours=" + AUTO_HOURS + "&limit=3000", { headers: serverHdr });
+  const ld = await lr.json().catch(() => null);
+  if (!lr.ok || !ld || ld.ok === false) throw new Error("list failed: HTTP " + lr.status + " " + String((ld && ld.error) || ""));
+  const files = (Array.isArray(ld.files) ? ld.files : []).filter((f) => f && f.id && /^\s*(repo|crn|arn)/i.test(String(f.name || "")));
+
+  const days = {};
+  for (const f of files) { const d = dayOf(f); (days[d] = days[d] || []).push(f); }
+  const state = {};
+  for (const d of Object.keys(days)) state[d] = await fsGetDay(d);
+
+  const todo = [];
+  for (const d of Object.keys(days)) {
+    for (const f of days[d]) {
+      const e = state[d][f.id];
+      if (!e || ((!e.p || !e.l) && e.a < AUTO_MAX_ATTEMPTS)) todo.push({ f, d, prev: e || null });
+    }
+  }
+  todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
+  const queue = todo.slice(0, AUTO_MAX_PER_RUN);
+
+  let processed = 0, plates = 0, lessors = 0;
+  const CHUNK = 9;
+  for (let i = 0; i < queue.length; i += CHUNK) {
+    if (Date.now() - t0 > AUTO_BUDGET_MS) break;
+    const chunk = queue.slice(i, i + CHUNK);
+    const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, (it) => resolveOnePlate(it.f.id, "both", serverHdr));
+    const save = {};
+    chunk.forEach((it, k) => {
+      const r = outs[k];
+      const prev = it.prev || { p: "", l: "", c: "", a: 0 };
+      const p = (r && r.plate) || prev.p || "";
+      const l = (r && r.lessor && r.lessor.name) || prev.l || "";
+      const c = (r && r.lessor && r.lessor.cr) || prev.c || "";
+      if (p) plates++;
+      if (l) lessors++;
+      (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
+      processed++;
+    });
+    for (const d of Object.keys(save)) await fsSaveDay(d, save[d]);
+  }
+  const out = { listed: files.length, todo: todo.length, processed, plates, lessors, ms: Date.now() - t0 };
+  console.log("[auto-run] " + JSON.stringify(out));
+  return out;
+}
+
+app.post("/api/certificates/auto-run", async (req, res) => {
+  if (!SERVER_KEY || !keyEq(req.headers["x-server-key"] || "", SERVER_KEY)) return res.status(403).json({ ok: false, error: "forbidden" });
+  if (autoRunning) return res.json({ ok: true, skipped: "already running" });
+  autoRunning = true;
+  try {
+    res.json(Object.assign({ ok: true }, await autoRunOnce()));
+  } catch (e) {
+    console.log("[auto-run] error: " + String((e && e.message) || e).slice(0, 300));
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
+  } finally {
+    autoRunning = false;
   }
 });
 
