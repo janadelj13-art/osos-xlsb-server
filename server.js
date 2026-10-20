@@ -162,6 +162,85 @@ function extractPlateFromText(text) {
 }
 
 /* =================================================================
+ * شهادات سجل (REPO/CRN): قراءة اللوحة من مكان الحقل في الصفحة مباشرة
+ * -----------------------------------------------------------------
+ * الحروف العربي في شهادات سجل متخزنة كأرقام "شكل الحرف" (glyph) في خط
+ * Microsoft Sans Serif من غير جدول تحويل لحروف، فالنص بيطلع رموز غريبة.
+ * أرقام الأشكال دي ثابتة في الخط (اتأكدنا منها من cmap الخط المدمج في الشهادات
+ * نفسها)، فبنحولها لحروف عربي بجدول ثابت — من غير OCR ومن غير تخمين.
+ * وبنمسك قيمة الحقل من السطر بتاع عنوانه ("رقم اللوحة باللغة العربية/الإنجليزية")
+ * فالمسافات بين الحروف أو بين الأرقام (زي "3 4 2 0 U N R") مش بتفرق.
+ * ================================================================= */
+const SIJIL_GID_AR = {"787":"ا","788":"أ","789":"آ","790":"إ","791":"ب","792":"ت","794":"ج","796":"ح","797":"ح","798":"خ","799":"خ","800":"س","801":"ش","802":"ص","813":"ض","814":"ع","815":"ع","816":"ع","818":"غ","819":"غ","820":"ف","821":"ف","823":"ق","824":"ق","825":"ك","826":"ل","827":"م","828":"ن","829":"ه","830":"ه","831":"ه","832":"ي","833":"ي","834":"ة","835":"ى","837":"ئ","838":"لا","839":"لا","843":"لأ","844":"لأ","845":"لآ","848":"لآ","851":"ء","852":"آ","853":"أ","854":"ؤ","855":"إ","857":"ا","858":"ب","859":"ة","860":"ت","863":"ح","865":"د","866":"ذ","867":"ر","868":"ز","869":"س","871":"ص","872":"ض","873":"ط","874":"ظ","875":"ع","877":"ـ","878":"ف","879":"ق","880":"ك","881":"ل","882":"م","883":"ن","884":"ه","885":"و","886":"ى","887":"ي","896":"لإ","897":"لإ","903":"ى","1022":"ل","2694":"الله","2695":"رال","3035":"ر","3036":"ز","3050":"ت","3051":"ث","3052":"ي","3162":"محمد","3163":"صلىاللهعليهوسلم","3165":"جلجلاله"};
+// الحروف اللي بتيجي في اللوح السعودية بس (شكل الحرف المنفصل في الخط)
+const SIJIL_PLATE_GID = { 857: "ا", 858: "ب", 863: "ح", 865: "د", 867: "ر", 869: "س", 871: "ص", 873: "ط", 875: "ع", 879: "ق", 880: "ك", 881: "ل", 882: "م", 883: "ن", 884: "ه", 885: "و", 886: "ى" };
+// تحويل حروف اللوحة الإنجليزي للعربي (جدول اللوح السعودية الرسمي)
+const EN_TO_AR_PLATE = { A: "ا", B: "ب", J: "ح", D: "د", R: "ر", S: "س", X: "ص", T: "ط", E: "ع", G: "ق", K: "ك", L: "ل", Z: "م", N: "ن", H: "ه", U: "و", V: "ى" };
+function englishPlateToArabic(plate) {
+  const m = String(plate || "").trim().match(/^([A-Za-z]{3})\s*(\d{1,4})$/);
+  if (!m) return plate;
+  const letters = m[1].toUpperCase().split("");
+  if (!letters.every((c) => EN_TO_AR_PLATE[c])) return plate; // حرف مش في جدول اللوح السعودية: نسيبها زي ما هي
+  return letters.map((c) => EN_TO_AR_PLATE[c]).join("") + " " + m[2];
+}
+// نص العنصر (بالترتيب المرئي من الشمال لليمين) → نص عربي مقروء (من اليمين للشمال)
+function sijilDecodeLabel(str) {
+  const out = [];
+  for (const ch of String(str || "")) {
+    const cp = ch.codePointAt(0);
+    if (cp < 128) { if (ch !== " " && ch !== ":") out.push(ch); continue; }
+    out.push(SIJIL_GID_AR[cp] || "?");
+  }
+  return out.reverse().join("");
+}
+async function plateFromSijilItems(pdf) {
+  const page = await pdf.getPage(1);
+  const content = await page.getTextContent();
+  const items = content.items.filter((it) => it.str && it.str.trim());
+  let arLabel = null, enLabel = null;
+  for (const it of items) {
+    const t = sijilDecodeLabel(it.str);
+    if (!/اللوحةباللغة/.test(t)) continue;
+    if (/العربية/.test(t)) arLabel = it;
+    else if (/نجليزية/.test(t)) enLabel = it;
+  }
+  // قيمة الحقل = العناصر اللي على نفس السطر وعلى شمال العنوان (لحد العنوان اللي قبله في نفس السطر)
+  function valueOf(label) {
+    if (!label) return null;
+    const ly = label.transform[5], lx = label.transform[4];
+    const row = items.filter((it) => it !== label && Math.abs(it.transform[5] - ly) < 3 && it.transform[4] < lx)
+      .sort((a, b) => a.transform[4] - b.transform[4]);
+    // نوقف عند أي عنوان تاني على نفس السطر (بيخلص بـ ":")
+    let start = 0;
+    row.forEach((it, i) => { if (/:\s*$/.test(it.str) || /^\s*:/.test(it.str)) start = i + 1; });
+    return row.slice(start).map((it) => it.str).join(" ");
+  }
+  // 1) العربي: أرقام + أشكال حروف (بالترتيب المرئي، فبنقلب الحروف عشان تبقى من اليمين)
+  const arVal = valueOf(arLabel);
+  if (arVal) {
+    const digits = (arVal.match(/\d/g) || []).join("");
+    const letters = [];
+    let bad = false;
+    for (const ch of arVal) {
+      const cp = ch.codePointAt(0);
+      if (cp < 128) { if (!/[\d\s\-]/.test(ch)) bad = true; continue; }
+      if (SIJIL_PLATE_GID[cp]) letters.push(SIJIL_PLATE_GID[cp]); else bad = true;
+    }
+    if (!bad && letters.length === 3 && digits.length >= 1 && digits.length <= 4) return letters.reverse().join("") + " " + digits;
+  }
+  // 2) الإنجليزي (بأي مسافات) → نحوله عربي
+  const enVal = valueOf(enLabel);
+  if (enVal) {
+    const v = enVal.replace(/[\s\-]+/g, "").toUpperCase();
+    let m = v.match(/^([A-Z]{3})(\d{1,4})$/);
+    if (m) return englishPlateToArabic(m[1] + " " + m[2]);
+    m = v.match(/^(\d{1,4})([A-Z]{3})$/);
+    if (m) return englishPlateToArabic(m[2] + " " + m[1]);
+  }
+  return null;
+}
+
+/* =================================================================
  * OCR للعربي (حل أخير، بس للشهادات اللي فشل معاها استخراج النص العادي)
  * -----------------------------------------------------------------
  * المشكلة: الفونت العربي في الشهادات دي بيتحول لرموز عشوائية لما نحاول
@@ -507,7 +586,10 @@ async function resolveOnePlateRaw(id, mode, authHeader) {
     const { text } = await extractText(pdf, { mergePages: true });
     const wantPlate = mode !== "lessor";   // mode: "lessor" = أسماء الشركات بس | "plate" = أرقام اللوحات بس | غير كده = الاتنين
     const wantLessor = mode !== "plate";
-    let result = (wantPlate && text) ? extractPlateFromText(text) : null;
+    let result = null;
+    // شهادات سجل: من مكان الحقل في الصفحة (الأدق، وبيقرا العربي من غير OCR)
+    if (wantPlate) { try { result = await plateFromSijilItems(pdf); } catch (e) { result = null; } }
+    if (wantPlate && !result && text) result = extractPlateFromText(text);
     if (wantPlate && !result) {
       // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
       // في الفونت نفسه)، فنحول الصفحة لصورة ونقراها بالعربي (OCR) بدل النص
@@ -516,6 +598,7 @@ async function resolveOnePlateRaw(id, mode, authHeader) {
     // اسم المؤجر (طالب التنفيذ) — فشله مايأثرش على رقم اللوحة
     let lessor = null;
     if (wantLessor) { try { lessor = await resolveLessor(pdf, text || "", id); } catch (e) { lessor = null; } }
+    if (result) result = englishPlateToArabic(result); // اللوحة الإنجليزي تتكتب بالحروف العربي
     return { plate: result, lessor };
   } finally {
     clearTimeout(abortTimer);
