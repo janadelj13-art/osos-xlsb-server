@@ -176,13 +176,15 @@ const SIJIL_GID_AR = {"787":"ا","788":"أ","789":"آ","790":"إ","791":"ب","79
 const SIJIL_PLATE_GID = { 857: "ا", 858: "ب", 863: "ح", 865: "د", 867: "ر", 869: "س", 871: "ص", 873: "ط", 875: "ع", 879: "ق", 880: "ك", 881: "ل", 882: "م", 883: "ن", 884: "ه", 885: "و", 886: "ى" };
 const SIJIL_PLATE_LETTERS = new Set("ابحدرسصطعقكلمنهوىي".split(""));
 // تحويل حروف اللوحة الإنجليزي للعربي (جدول اللوح السعودية الرسمي)
-const EN_TO_AR_PLATE = { A: "ا", B: "ب", J: "ح", D: "د", R: "ر", S: "س", X: "ص", T: "ط", E: "ع", G: "ق", K: "ك", L: "ل", Z: "م", N: "ن", H: "ه", U: "و", V: "ى" };
+const EN_TO_AR_PLATE = { A: "ا", B: "ب", J: "ح", D: "د", R: "ر", S: "س", X: "ص", T: "ط", E: "ع", G: "ق", K: "ك", L: "ل", Z: "م", N: "ن", H: "ه", U: "و", V: "ي" };
 function englishPlateToArabic(plate) {
   const m = String(plate || "").trim().match(/^([A-Za-z]{3})\s*(\d{1,4})$/);
   if (!m) return plate;
   const letters = m[1].toUpperCase().split("");
   if (!letters.every((c) => EN_TO_AR_PLATE[c])) return plate; // حرف مش في جدول اللوح السعودية: نسيبها زي ما هي
-  return letters.map((c) => EN_TO_AR_PLATE[c]).join("") + " " + m[2];
+  // الحروف الإنجليزي بتتقري من الشمال لليمين والعربي من اليمين للشمال، وكل حرف عربي فوق اللي يقابله
+  // في اللوحة → الترتيب العربي = عكس الإنجليزي (اتأكدنا: "V N R" في نفس الشهادة عربيها "ر ن ي")
+  return letters.reverse().map((c) => EN_TO_AR_PLATE[c]).join("") + " " + m[2];
 }
 // نص العنصر (بالترتيب المرئي من الشمال لليمين) → نص عربي مقروء (من اليمين للشمال)
 function sijilDecodeLabel(str) {
@@ -640,7 +642,13 @@ async function resolveOnePlateRaw(id, mode, authHeader) {
     // الترتيب: الإنجليزي الأول (سجل بالمكان، وبعده عنوان الحقل في النص)، وبعدين العربي
     if (wantPlate) { try { result = await plateFromSijilItems(pdf, "en"); } catch (e) { result = null; } }
     if (wantPlate && !result && text) result = grabEnglishPlateAfterLabel(text);
-    if (wantPlate && !result) { try { result = await plateFromSijilItems(pdf, "ar"); } catch (e) { result = null; } }
+    if (result) result = englishPlateToArabic(result);
+    if (wantPlate) {
+      let ar = null;
+      try { ar = await plateFromSijilItems(pdf, "ar"); } catch (e) { ar = null; }
+      // لو الشهادة فيها الاتنين واختلفوا، العربي المكتوب في الشهادة هو المرجع
+      if (ar && (!result || ar.replace(/\s+/g, "") !== result.replace(/\s+/g, ""))) result = ar;
+    }
     if (wantPlate && !result && text) result = extractPlateFromText(text);
     if (wantPlate && !result) {
       // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
