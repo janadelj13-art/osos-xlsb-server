@@ -193,7 +193,7 @@ function sijilDecodeLabel(str) {
   }
   return out.reverse().join("");
 }
-async function plateFromSijilItems(pdf) {
+async function plateFromSijilItems(pdf, want) {
   const page = await pdf.getPage(1);
   const content = await page.getTextContent();
   const items = content.items.filter((it) => it.str && it.str.trim());
@@ -215,7 +215,17 @@ async function plateFromSijilItems(pdf) {
     row.forEach((it, i) => { if (/:\s*$/.test(it.str) || /^\s*:/.test(it.str)) start = i + 1; });
     return row.slice(start).map((it) => it.str).join(" ");
   }
-  // 1) العربي: أرقام + أشكال حروف (بالترتيب المرئي، فبنقلب الحروف عشان تبقى من اليمين)
+  // الإنجليزي الأول (بأي مسافات) → نحوله عربي
+  const enVal = want === "ar" ? null : valueOf(enLabel);
+  if (enVal) {
+    const v = enVal.replace(/[\s\-]+/g, "").toUpperCase();
+    let m = v.match(/^([A-Z]{3})(\d{1,4})$/);
+    if (m) return englishPlateToArabic(m[1] + " " + m[2]);
+    m = v.match(/^(\d{1,4})([A-Z]{3})$/);
+    if (m) return englishPlateToArabic(m[2] + " " + m[1]);
+  }
+  if (want === "en") return null;
+  // بعده العربي: أرقام + أشكال حروف (بالترتيب المرئي، فبنقلب الحروف عشان تبقى من اليمين)
   const arVal = valueOf(arLabel);
   if (arVal) {
     const digits = (arVal.match(/\d/g) || []).join("");
@@ -227,15 +237,6 @@ async function plateFromSijilItems(pdf) {
       if (SIJIL_PLATE_GID[cp]) letters.push(SIJIL_PLATE_GID[cp]); else bad = true;
     }
     if (!bad && letters.length === 3 && digits.length >= 1 && digits.length <= 4) return letters.reverse().join("") + " " + digits;
-  }
-  // 2) الإنجليزي (بأي مسافات) → نحوله عربي
-  const enVal = valueOf(enLabel);
-  if (enVal) {
-    const v = enVal.replace(/[\s\-]+/g, "").toUpperCase();
-    let m = v.match(/^([A-Z]{3})(\d{1,4})$/);
-    if (m) return englishPlateToArabic(m[1] + " " + m[2]);
-    m = v.match(/^(\d{1,4})([A-Z]{3})$/);
-    if (m) return englishPlateToArabic(m[2] + " " + m[1]);
   }
   return null;
 }
@@ -512,7 +513,51 @@ async function ocrBand(page, band, debugId) {
 }
 
 // بيرجّع { name, cr } أو null
+// توثيق: اسم المؤجر من مكانه في الصفحة. الكلمات في النص بتطلع مقلوبة الترتيب في السطر
+// ("الراجحي مصرف :االسم") وكلمة الاسم ساعات بتطلع "االسم"، فبنقرا السطر من مواضع الكلمات:
+// عنوان "المؤجر (طالب التنفيذ)" → أول سطر تحته فيه "الاسم" → الكلمات اللي على شماله لحد الحقل اللي بعده.
+async function tawtheeqLessorFromItems(pdf) {
+  const page = await pdf.getPage(1);
+  const content = await page.getTextContent();
+  const items = content.items.filter((it) => it.str && it.str.trim()).map((it) => ({ s: it.str.trim(), x: it.transform[4], y: it.transform[5], w: it.width || 0 }));
+  const lines = new Map();
+  for (const it of items) { const k = Math.round(it.y); let key = null; for (const kk of lines.keys()) if (Math.abs(kk - k) <= 2) { key = kk; break; } if (key == null) { key = k; lines.set(key, []); } lines.get(key).push(it); }
+  const lineText = (arr) => arr.slice().sort((a, b) => b.x - a.x).map((i) => i.s).join(" ");
+  let headY = null;
+  for (const [y, arr] of lines) {
+    const t = lineText(arr);
+    if (/المؤجر/.test(t) && /طالب/.test(t) && /التنفيذ/.test(t) && !/المستأجر/.test(t)) { if (headY == null || y > headY) headY = y; }
+  }
+  if (headY == null) return null;
+  const isNameLabel = (s) => /^(?:ا?الاسم|االسم|الإسم)\s*:?$/.test(s);
+  const below = [...lines.keys()].filter((y) => y < headY && headY - y < 120).sort((a, b) => b - a);
+  for (const y of below) {
+    const arr = lines.get(y).slice().sort((a, b) => b.x - a.x);   // من اليمين للشمال
+    const li = arr.findIndex((i) => isNameLabel(i.s));
+    if (li < 0) continue;
+    const words = [];
+    let prevX = arr[li].x;
+    for (let j = li + 1; j < arr.length; j++) {
+      const it = arr[j];
+      if (it.s === ":" ) { if (!words.length) { prevX = it.x; continue; } break; }
+      if (prevX - (it.x + it.w) > 40) break;            // فراغ كبير = حقل تاني
+      if (/[:0-9]/.test(it.s)) break;
+      words.push(it.s); prevX = it.x;
+    }
+    const name = cleanLessorName(words.join(" "));
+    if (name) return name;
+  }
+  return null;
+}
+
 async function resolveLessor(pdf, text, id) {
+  // توثيق (النص مقروء): الاسم من مكانه في الصفحة الأول
+  if (/توثيق|Tawtheeq/i.test(text || "")) {
+    try {
+      const nm = await tawtheeqLessorFromItems(pdf);
+      if (nm) { const loc0 = await locateLessor(pdf); return { name: nm, cr: loc0.cr || null }; }
+    } catch (e) {}
+  }
   const loc = await locateLessor(pdf);
   // شهادات توثيق: الاسم نص عادي مقروء → نقراه مباشرة من النص (أسرع وأدق من OCR، ومن غير ما نخمّن رقم السجل)
   let name = null;
@@ -588,7 +633,10 @@ async function resolveOnePlateRaw(id, mode, authHeader) {
     const wantLessor = mode !== "plate";
     let result = null;
     // شهادات سجل: من مكان الحقل في الصفحة (الأدق، وبيقرا العربي من غير OCR)
-    if (wantPlate) { try { result = await plateFromSijilItems(pdf); } catch (e) { result = null; } }
+    // الترتيب: الإنجليزي الأول (سجل بالمكان، وبعده عنوان الحقل في النص)، وبعدين العربي
+    if (wantPlate) { try { result = await plateFromSijilItems(pdf, "en"); } catch (e) { result = null; } }
+    if (wantPlate && !result && text) result = grabEnglishPlateAfterLabel(text);
+    if (wantPlate && !result) { try { result = await plateFromSijilItems(pdf, "ar"); } catch (e) { result = null; } }
     if (wantPlate && !result && text) result = extractPlateFromText(text);
     if (wantPlate && !result) {
       // ملاذ أخير: الفونت العربي في الشهادة ده مش قابل للقراءة كنص (مشكلة معروفة
