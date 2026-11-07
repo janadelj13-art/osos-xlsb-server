@@ -792,6 +792,279 @@ async function fsSaveDay(day, entries) {
   if (!r.ok) throw new Error("firestore save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
 }
 
+/* ============================================================
+   إشعارات الآيفون (Push) لحسابات الأدمن: "نزلت شهادات جديدة"
+   - تطبيق الآيفون بيحفظ رقم الجهاز في users/{uid}.pushTokens (للأدمن بس)
+   - بعد كل جولة auto-run: لو فيه شهادات أول مرة تتشاف -> إشعار لكل أجهزة الأدمن
+   - محتاج 3 Variables في Cloud Run (من حساب Apple Developer):
+       APNS_KEY     = محتوى ملف AuthKey_XXXX.p8 كامل
+       APNS_KEY_ID  = Key ID (10 حروف)
+       APNS_TEAM_ID = Team ID (10 حروف)
+     ولو مش موجودين: الإشعارات بتتقفل بهدوء وكل حاجة تانية شغالة عادي.
+   ============================================================ */
+const http2 = require("http2");
+const APNS_KEY = String(process.env.APNS_KEY || "").replace(/\\n/g, "\n").trim();
+const APNS_KEY_ID = String(process.env.APNS_KEY_ID || "").trim();
+const APNS_TEAM_ID = String(process.env.APNS_TEAM_ID || "").trim();
+const APNS_TOPIC = String(process.env.APNS_TOPIC || "com.osos.app").trim();
+const FS_DOCS = "https://firestore.googleapis.com/v1/projects/" + FS_PROJECT + "/databases/(default)/documents";
+let apnsJwt = { v: "", at: 0 };
+
+function b64url(buf) {
+  return Buffer.from(buf).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function apnsAuth() {
+  // Apple بتقبل نفس التوكن لحد ساعة -- بنجدده كل 40 دقيقة
+  if (apnsJwt.v && Date.now() - apnsJwt.at < 40 * 60 * 1000) return apnsJwt.v;
+  const head = b64url(JSON.stringify({ alg: "ES256", kid: APNS_KEY_ID }));
+  const claims = b64url(JSON.stringify({ iss: APNS_TEAM_ID, iat: Math.floor(Date.now() / 1000) }));
+  const sig = crypto.sign("sha256", Buffer.from(head + "." + claims), { key: APNS_KEY, dsaEncoding: "ieee-p1363" });
+  apnsJwt = { v: head + "." + claims + "." + b64url(sig), at: Date.now() };
+  return apnsJwt.v;
+}
+
+// اتصال واحد لكل سيرفر Apple (HTTP/2 بيبعت كتير على نفس الاتصال)
+function apnsSession(host, cache) {
+  let c = cache[host];
+  if (c && !c.closed && !c.destroyed) return c;
+  c = http2.connect("https://" + host);
+  c.on("error", () => {});
+  cache[host] = c;
+  return c;
+}
+
+function apnsSendOne(host, token, payload, cache) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    let req;
+    try {
+      req = apnsSession(host, cache).request({
+        ":method": "POST",
+        ":path": "/3/device/" + token,
+        "authorization": "bearer " + apnsAuth(),
+        "apns-topic": APNS_TOPIC,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+        "content-type": "application/json"
+      });
+    } catch (e) { return finish({ status: 0, reason: String((e && e.message) || e) }); }
+    let status = 0, body = "";
+    req.on("response", (h) => { status = Number(h[":status"]) || 0; });
+    req.setEncoding("utf8");
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let reason = "";
+      try { reason = (JSON.parse(body || "{}").reason) || ""; } catch (_) {}
+      finish({ status, reason });
+    });
+    req.on("error", (e) => finish({ status: 0, reason: String((e && e.message) || e) }));
+    req.setTimeout(15000, () => { try { req.close(); } catch (_) {} finish({ status: 0, reason: "timeout" }); });
+    req.end(JSON.stringify(payload));
+  });
+}
+
+// النسخة من المتجر/TestFlight بتستخدم سيرفر Apple الأساسي، ونسخة التجربة من Xcode بتستخدم sandbox
+async function apnsSend(token, payload, cache) {
+  let r = await apnsSendOne("api.push.apple.com", token, payload, cache);
+  if (r.status === 400 && r.reason === "BadDeviceToken") r = await apnsSendOne("api.sandbox.push.apple.com", token, payload, cache);
+  return r;
+}
+
+const apnsReady = () => !!(APNS_KEY && APNS_KEY_ID && APNS_TEAM_ID);
+
+// يبعت لقايمة أجهزة [{uid, token}] -- 20 مع بعض -- ويشيل الأرقام اللي Apple قالت إنها مبقتش شغالة
+async function pushToDevices(list, payload) {
+  const seen = new Set();
+  list = list.filter((x) => x && x.token && !seen.has(x.token) && seen.add(x.token));
+  if (!list.length) return { sent: 0, devices: 0 };
+  const cache = {};
+  let sent = 0, failed = 0, removed = 0;
+  try {
+    for (let i = 0; i < list.length; i += 20) {
+      const part = list.slice(i, i + 20);
+      const rs = await Promise.all(part.map((it) => apnsSend(it.token, payload, cache)));
+      for (let k = 0; k < part.length; k++) {
+        const r = rs[k], it = part[k];
+        if (r.status === 200) { sent++; continue; }
+        failed++;
+        if (r.status === 410 || r.reason === "Unregistered" || r.reason === "BadDeviceToken" || r.reason === "DeviceTokenNotForTopic") {
+          await removePushToken(it.uid, it.token);
+          removed++;
+        } else {
+          console.log("[push] fail " + r.status + " " + r.reason);
+        }
+      }
+    }
+  } finally {
+    for (const h of Object.keys(cache)) { try { cache[h].close(); } catch (_) {} }
+  }
+  return { sent, failed, removed, devices: list.length };
+}
+
+function tokensOfDoc(doc) {
+  const uid = String((doc && doc.name) || "").split("/").pop();
+  const toks = ((((doc && doc.fields) || {}).pushTokens || {}).mapValue || {}).fields || {};
+  const out = [];
+  for (const tok of Object.keys(toks)) {
+    const f = ((toks[tok] || {}).mapValue || {}).fields || {};
+    const p = (f.p && f.p.stringValue) || "ios";
+    if (p === "ios" && /^[0-9a-f]{32,200}$/i.test(tok)) out.push({ uid, token: tok });
+  }
+  return out;
+}
+
+async function fsRunQuery(structuredQuery) {
+  const r = await fetch(FS_DOCS + ":runQuery", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+    body: JSON.stringify({ structuredQuery })
+  });
+  if (!r.ok) throw new Error("firestore query HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+  const rows = await r.json();
+  return (Array.isArray(rows) ? rows : []).map((x) => x && x.document).filter(Boolean);
+}
+
+async function fsGetDoc(path) {
+  const r = await fetch(FS_DOCS + "/" + path, { headers: { Authorization: "Bearer " + (await gcpToken()) } });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error("firestore get HTTP " + r.status);
+  return r.json();
+}
+
+const fv = (doc, k) => {
+  const f = ((doc && doc.fields) || {})[k];
+  if (!f) return undefined;
+  if ("stringValue" in f) return f.stringValue;
+  if ("booleanValue" in f) return f.booleanValue;
+  if ("integerValue" in f) return Number(f.integerValue);
+  if ("arrayValue" in f) return ((f.arrayValue || {}).values || []).map((v) => v.stringValue || "");
+  if ("timestampValue" in f) return f.timestampValue;
+  return undefined;
+};
+
+// أجهزة الأدمن: [{ uid, token }]
+async function adminPushTokens() {
+  const docs = await fsRunQuery({
+    from: [{ collectionId: "users" }],
+    where: { fieldFilter: { field: { fieldPath: "isAdmin" }, op: "EQUAL", value: { booleanValue: true } } }
+  });
+  return docs.flatMap(tokensOfDoc);
+}
+
+// رقم جهاز Apple قالت إنه مبقاش شغال (التطبيق اتمسح مثلاً) -> نشيله من الحساب
+async function removePushToken(uid, tok) {
+  const mask = "updateMask.fieldPaths=" + encodeURIComponent("pushTokens.`" + tok + "`");
+  await fetch(FS_DOCS + "/users/" + encodeURIComponent(uid) + "?" + mask + "&currentDocument.exists=true", {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: {} })
+  }).catch(() => {});
+}
+
+async function pushNewCertsToAdmins(n) {
+  if (!n) return { sent: 0 };
+  if (!apnsReady()) return { sent: 0, skipped: "no apns key" };
+  return pushToDevices(await adminPushTokens(), {
+    aps: { alert: { title: "📄 لوحات تثبيت جديدة (" + n + ")" }, sound: "default" },
+    tab: "cert"
+  });
+}
+
+/* ---------- حساب اللي بيكلّم السيرفر (من التطبيق) ----------
+   التطبيق بيبعت Firebase ID token في Authorization، وإحنا بنتأكد منه عند Google */
+const FB_API_KEY = String(process.env.FIREBASE_API_KEY || "AIzaSyBdV7HnjXHJfnvRCFVOcE1MMetCBov7-L8").trim();
+async function uidFromReq(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+  if (!m) return "";
+  const r = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" + encodeURIComponent(FB_API_KEY), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ idToken: m[1] })
+  });
+  if (!r.ok) return "";
+  const d = await r.json().catch(() => null);
+  return (d && Array.isArray(d.users) && d.users[0] && d.users[0].localId) || "";
+}
+
+// تسجيل/شيل رقم جهاز الآيفون للحساب (أي مشترك)
+// POST /api/push/register  { token, on: true|false, label }
+app.post("/api/push/register", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const tok = String((req.body && req.body.token) || "").toLowerCase();
+    if (!/^[0-9a-f]{32,200}$/.test(tok)) return res.status(400).json({ ok: false, error: "token" });
+    const on = !(req.body && req.body.on === false);
+    const mask = "updateMask.fieldPaths=" + encodeURIComponent("pushTokens.`" + tok + "`") + "&currentDocument.exists=true";
+    const body = on ? { fields: { pushTokens: { mapValue: { fields: { [tok]: { mapValue: { fields: {
+      p: { stringValue: "ios" },
+      at: { stringValue: new Date().toISOString() },
+      label: { stringValue: String((req.body && req.body.label) || "").slice(0, 80) }
+    } } } } } } } } : { fields: {} };
+    const r = await fetch(FS_DOCS + "/users/" + encodeURIComponent(uid) + "?" + mask, {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) return res.status(500).json({ ok: false, error: "save HTTP " + r.status });
+    res.json({ ok: true, push: apnsReady() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
+// إشعار الإدارة الجديد -> ستارة الآيفون للمشتركين اللي اتحددوا (أو للكل)
+// POST /api/push/post  { id }   (الأدمن بس)
+app.post("/api/push/post", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me || fv(me, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
+    const id = String((req.body && req.body.id) || "");
+    if (!/^[\w-]{1,80}$/.test(id)) return res.status(400).json({ ok: false, error: "id" });
+    const post = await fsGetDoc("announcements/" + id);
+    if (!post) return res.status(404).json({ ok: false, error: "post not found" });
+    if (fv(post, "pushedAt")) return res.json({ ok: true, skipped: "already sent" });
+    if (!apnsReady()) return res.json({ ok: true, sent: 0, skipped: "no apns key" });
+
+    // نعلّم الإشعار إنه اتبعت الأول (عشان مايتبعتش مرتين لو الطلب اتكرر)
+    await fetch(FS_DOCS + "/announcements/" + id + "?updateMask.fieldPaths=pushedAt&currentDocument.exists=true", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { pushedAt: { stringValue: new Date().toISOString() } } })
+    });
+
+    const report = fv(post, "report") === true;
+    const masked = fv(post, "masked") === true;
+    const text = String(fv(post, "text") || "");
+    const companies = fv(post, "companies") || [];
+    const payload = report
+      ? { aps: { alert: { title: "📊 تقرير يومي جديد: " + companies.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" }, tab: "cert" }
+      : { aps: { alert: { title: "📢 إشعار من الإدارة", body: masked ? "وصل إشعار جديد من الإدارة — افتح التطبيق لعرضه" : text.slice(0, 400) }, sound: "default" } };
+
+    // المستلمين: الكل، أو الحسابات اللي الأدمن اختارها (+ الأدمن بيشوف كل الإشعارات)
+    let docs;
+    if (fv(post, "audience") === "some") {
+      const targets = (fv(post, "targets") || []).filter(Boolean).slice(0, 500);
+      docs = [];
+      for (let i = 0; i < targets.length; i += 10) {
+        const part = await Promise.all(targets.slice(i, i + 10).map((t) => fsGetDoc("users/" + encodeURIComponent(t)).catch(() => null)));
+        docs.push(...part.filter(Boolean));
+      }
+    } else {
+      docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
+    }
+    docs = docs.filter((d) => fv(d, "status") !== "paused");
+    const out = await pushToDevices(docs.flatMap(tokensOfDoc), payload);
+    res.json(Object.assign({ ok: true }, out));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
 async function autoRunOnce() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
@@ -815,7 +1088,7 @@ async function autoRunOnce() {
   todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
   const queue = todo.slice(0, AUTO_MAX_PER_RUN);
 
-  let processed = 0, plates = 0, lessors = 0;
+  let processed = 0, plates = 0, lessors = 0, fresh = 0;
   const CHUNK = 9;
   for (let i = 0; i < queue.length; i += CHUNK) {
     if (Date.now() - t0 > AUTO_BUDGET_MS) break;
@@ -831,14 +1104,24 @@ async function autoRunOnce() {
       if (p) plates++;
       if (l) lessors++;
       (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
+      if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة (للإشعار)
       processed++;
     });
     for (const d of Object.keys(save)) await fsSaveDay(d, save[d]);
   }
-  const out = { listed: files.length, todo: todo.length, processed, plates, lessors, ms: Date.now() - t0 };
+  let push = null;
+  try { push = await pushNewCertsToAdmins(fresh); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
+  const out = { listed: files.length, todo: todo.length, processed, fresh, plates, lessors, push, ms: Date.now() - t0 };
   console.log("[auto-run] " + JSON.stringify(out));
   return out;
 }
+
+// تجربة إشعار الآيفون: POST /api/push/test بنفس المفتاح السري (SERVER_KEY)
+app.post("/api/push/test", async (req, res) => {
+  if (!SERVER_KEY || !keyEq(req.headers["x-server-key"] || "", SERVER_KEY)) return res.status(403).json({ ok: false, error: "forbidden" });
+  try { res.json(Object.assign({ ok: true }, await pushNewCertsToAdmins(1))); }
+  catch (e) { res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+});
 
 app.post("/api/certificates/auto-run", async (req, res) => {
   if (!SERVER_KEY || !keyEq(req.headers["x-server-key"] || "", SERVER_KEY)) return res.status(403).json({ ok: false, error: "forbidden" });
