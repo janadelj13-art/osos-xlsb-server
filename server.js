@@ -1065,6 +1065,93 @@ app.post("/api/push/post", async (req, res) => {
   }
 });
 
+/* ============================================================
+   التقرير اليومي التلقائي
+   كل شهادة جديدة اتقرا رقم لوحتها واسم الشركة المؤجرة بتاعتها، بتنضاف لوحتها لتقرير الشركة دي
+   في «التقارير اليومية» للمشتركين على طول (من غير ما الأدمن يعمل حاجة).
+   - الشركة اللي اسمها في قايمة شركات التقارير بتنضاف لنفس كارتها (مع تقارير الأدمن).
+   - أي شركة تانية ليها كارت باسمها.
+   - الشهادة اللي اسم شركتها مااتقراش: مابتدخلش تقرير (بتفضل في شاشة الشهادات بس).
+   AUTO_REPORTS=0 في Cloud Run بيقفل الخاصية دي.
+   ============================================================ */
+const AUTO_REPORTS = String(process.env.AUTO_REPORTS || "1") !== "0";
+// نفس قايمة التطبيق (index.html: REPORT_COMPANIES)
+const REPORT_COMPANIES = ["البنك الأهلي السعودي", "شركة الجبر للتمويل", "شركة راية للتمويل", "مصرف الراجحي", "شركة عبداللطيف جميل المتحدة", "شركة التيسير العربية للتمويل", "الفرنسي للتأجير", "شركة إيجارة للتمويل", "بنك البلاد", "الإمارات", "تأجير تمويلي", "جبر تمويلي", "بنك الرياض", "مصرف الإنماء", "بنك الجزيرة", "البنك العربي الوطني", "شركة امكان للتمويل"];
+
+function coNorm(s) {
+  return String(s || "")
+    .replace(/[ً-ٰٟـ]/g, "")
+    .replace(/[أإآ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي")
+    .replace(/(^|\s)شركه(?=\s|$)/g, " ")
+    .replace(/\s+/g, "");
+}
+
+// اسم الشركة في التقرير: لو الاسم المقروء هو واحدة من شركات القايمة -> اسمها في القايمة (عشان كارت واحد)
+function reportCompanyOf(lessor) {
+  const raw = String(lessor || "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const n = coNorm(raw);
+  if (n.length < 3) return "";
+  let best = "", bestLen = 0;
+  for (const c of REPORT_COMPANIES) {
+    const cn = coNorm(c);
+    if (cn.length < 4) continue;
+    if (n === cn || n.includes(cn) || (cn.includes(n) && n.length >= 6)) {
+      if (cn.length > bestLen) { best = c; bestLen = cn.length; }
+    }
+  }
+  return best || raw;
+}
+
+async function createAutoReports(byCompany) {
+  const cos = Object.keys(byCompany);
+  if (!cos.length) return { reports: 0 };
+  const base = Date.now();
+  let made = 0;
+  for (let i = 0; i < cos.length; i++) {
+    const co = cos[i];
+    const plates = Array.from(new Set(byCompany[co])).filter(Boolean);
+    if (!plates.length) continue;
+    const id = String(base + i);
+    const fields = {
+      text: { stringValue: plates.join("\n") },
+      id: { stringValue: id },
+      showClose: { booleanValue: true },
+      showSort: { booleanValue: true },
+      masked: { booleanValue: false },
+      showNote: { booleanValue: true },
+      report: { booleanValue: true },
+      auto: { booleanValue: true },
+      companies: { arrayValue: { values: [{ stringValue: co }] } },
+      audience: { stringValue: "all" },
+      targets: { arrayValue: { values: [] } },
+      targetNames: { arrayValue: { values: [] } },
+      pushedAt: { stringValue: new Date().toISOString() },
+      createdAt: { timestampValue: new Date().toISOString() }
+    };
+    const r = await fetch(FS_DOCS + "/announcements/" + id + "?currentDocument.exists=false", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ fields })
+    });
+    if (r.ok) made++;
+    else console.log("[auto-report] save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+  }
+  // إشعار واحد لكل المشتركين (ستارة الآيفون) بأسماء الشركات اللي نزلها تقرير
+  let push = null;
+  if (made && apnsReady()) {
+    try {
+      let docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
+      docs = docs.filter((d) => fv(d, "status") !== "paused");
+      push = await pushToDevices(docs.flatMap(tokensOfDoc), {
+        aps: { alert: { title: "📊 تقرير يومي جديد: " + cos.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" },
+        tab: "cert"
+      });
+    } catch (e) { push = { error: String((e && e.message) || e).slice(0, 150) }; }
+  }
+  return { reports: made, companies: cos.length, push };
+}
+
 async function autoRunOnce() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
@@ -1089,6 +1176,7 @@ async function autoRunOnce() {
   const queue = todo.slice(0, AUTO_MAX_PER_RUN);
 
   let processed = 0, plates = 0, lessors = 0, fresh = 0;
+  const repAdd = {};   // الشركة -> لوحات جديدة للتقرير اليومي
   const CHUNK = 9;
   for (let i = 0; i < queue.length; i += CHUNK) {
     if (Date.now() - t0 > AUTO_BUDGET_MS) break;
@@ -1105,13 +1193,20 @@ async function autoRunOnce() {
       if (l) lessors++;
       (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
       if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة (للإشعار)
+      // اللوحة والشركة اتقروا الاتنين لأول مرة في الجولة دي -> تدخل التقرير اليومي (مرة واحدة بس)
+      if (AUTO_REPORTS && p && l && !(prev.p && prev.l)) {
+        const co = reportCompanyOf(l);
+        if (co) (repAdd[co] = repAdd[co] || []).push(p);
+      }
       processed++;
     });
     for (const d of Object.keys(save)) await fsSaveDay(d, save[d]);
   }
   let push = null;
   try { push = await pushNewCertsToAdmins(fresh); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
-  const out = { listed: files.length, todo: todo.length, processed, fresh, plates, lessors, push, ms: Date.now() - t0 };
+  let reports = null;
+  try { reports = await createAutoReports(repAdd); } catch (e) { reports = { error: String((e && e.message) || e).slice(0, 200) }; }
+  const out = { listed: files.length, todo: todo.length, processed, fresh, plates, lessors, push, reports, ms: Date.now() - t0 };
   console.log("[auto-run] " + JSON.stringify(out));
   return out;
 }
