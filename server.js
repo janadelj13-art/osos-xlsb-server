@@ -1152,13 +1152,28 @@ async function createAutoReports(byCompany) {
   return { reports: made, companies: cos.length, push };
 }
 
+function needsOpenName(name) { return /^\s*(repo|crn|arn)/i.test(String(name || "")); }
+
+// ملف اسمه رقم لوحة ("ابح 1234.pdf" أو "ABC 1234.pdf") -> اللوحة بالعربي، وإلا ""
+function plateFromFileName(name) {
+  let n = String(name || "").replace(/\.pdf$/i, "").replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
+  n = englishPlateToArabic(n);
+  const m = n.match(/^([\u0621-\u064A])\s?([\u0621-\u064A])\s?([\u0621-\u064A])\s?(\d{1,4})$/);
+  return m ? (m[1] + m[2] + m[3] + " " + m[4]) : "";
+}
+
+const AUTO_REPORT_MAX_AGE_MS = 24 * 3600 * 1000;   // التقرير اليومي: شهادات آخر 24 ساعة بس
+
 async function autoRunOnce() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
   const lr = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/recent?hours=" + AUTO_HOURS + "&limit=3000", { headers: serverHdr });
   const ld = await lr.json().catch(() => null);
   if (!lr.ok || !ld || ld.ok === false) throw new Error("list failed: HTTP " + lr.status + " " + String((ld && ld.error) || ""));
-  const files = (Array.isArray(ld.files) ? ld.files : []).filter((f) => f && f.id && /^\s*(repo|crn|arn)/i.test(String(f.name || "")));
+  // كل ملفات PDF (زي زرار «استخراج» في التطبيق بالظبط):
+  //  - REPO/CRN/ARN: اللوحة + اسم الشركة من جوه الشهادة
+  //  - أي اسم تاني: الاسم نفسه هو رقم اللوحة، والشركة بتتقرا من جوه الشهادة
+  const files = (Array.isArray(ld.files) ? ld.files : []).filter((f) => f && f.id && (needsOpenName(f.name) || /\.pdf$/i.test(String(f.name || ""))));
 
   const days = {};
   for (const f of files) { const d = dayOf(f); (days[d] = days[d] || []).push(f); }
@@ -1181,7 +1196,12 @@ async function autoRunOnce() {
   for (let i = 0; i < queue.length; i += CHUNK) {
     if (Date.now() - t0 > AUTO_BUDGET_MS) break;
     const chunk = queue.slice(i, i + CHUNK);
-    const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, (it) => resolveOnePlate(it.f.id, "both", serverHdr));
+    const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, async (it) => {
+      if (needsOpenName(it.f.name)) return resolveOnePlate(it.f.id, "both", serverHdr);
+      // اسم الملف هو اللوحة: نقرا اسم الشركة بس (أسرع)
+      const r = await resolveOnePlate(it.f.id, "lessor", serverHdr);
+      return Object.assign({}, r || {}, { plate: plateFromFileName(it.f.name) || (r && r.plate) || null });
+    });
     const save = {};
     chunk.forEach((it, k) => {
       const r = outs[k];
@@ -1194,7 +1214,8 @@ async function autoRunOnce() {
       (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
       if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة (للإشعار)
       // اللوحة والشركة اتقروا الاتنين لأول مرة في الجولة دي -> تدخل التقرير اليومي (مرة واحدة بس)
-      if (AUTO_REPORTS && p && l && !(prev.p && prev.l)) {
+      const fAge = Date.now() - (Date.parse(it.f.createdTime || it.f.modifiedTime || "") || Date.now());
+      if (AUTO_REPORTS && p && l && !(prev.p && prev.l) && fAge <= AUTO_REPORT_MAX_AGE_MS) {
         const co = reportCompanyOf(l);
         if (co) (repAdd[co] = repAdd[co] || []).push(p);
       }
