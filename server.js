@@ -874,6 +874,36 @@ async function apnsSend(token, payload, cache) {
 
 const apnsReady = () => !!(APNS_KEY && APNS_KEY_ID && APNS_TEAM_ID);
 
+/* ---------- إشعارات الأندرويد (Firebase Cloud Messaging) ----------
+   مش محتاجة أي مفتاح: السيرفر بيبعت بصلاحية حساب Cloud Run نفسه (نفس اللي بيكتب في Firestore) */
+const FCM_URL = "https://fcm.googleapis.com/v1/projects/" + (process.env.FIRESTORE_PROJECT || "jta-cloud-daeb1") + "/messages:send";
+async function fcmSend(token, payload) {
+  const alert = ((payload && payload.aps) || {}).alert || {};
+  const data = {};
+  if (payload && payload.tab) data.tab = String(payload.tab);
+  const message = {
+    token,
+    notification: { title: String(alert.title || "OS OS"), body: String(alert.body || "") },
+    data,
+    android: { priority: "HIGH", notification: { channel_id: "osos_alerts", sound: "default" } }
+  };
+  try {
+    const r = await fetch(FCM_URL, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ message })
+    });
+    if (r.ok) return { status: 200, reason: "" };
+    const t = await r.text().catch(() => "");
+    const gone = r.status === 404 || /UNREGISTERED|registration-token-not-registered|not a valid FCM registration token/i.test(t);
+    return { status: r.status, reason: gone ? "Unregistered" : t.slice(0, 160) };
+  } catch (e) {
+    return { status: 0, reason: String((e && e.message) || e).slice(0, 160) };
+  }
+}
+// في حاجة نقدر نبعت بيها؟ (الأندرويد دايمًا، والآيفون لما مفتاح Apple يتحط)
+const pushReady = () => true;
+
 // يبعت لقايمة أجهزة [{uid, token}] -- 20 مع بعض -- ويشيل الأرقام اللي Apple قالت إنها مبقتش شغالة
 async function pushToDevices(list, payload) {
   const seen = new Set();
@@ -884,10 +914,13 @@ async function pushToDevices(list, payload) {
   try {
     for (let i = 0; i < list.length; i += 20) {
       const part = list.slice(i, i + 20);
-      const rs = await Promise.all(part.map((it) => apnsSend(it.token, payload, cache)));
+      const rs = await Promise.all(part.map((it) => it.p === "android"
+        ? fcmSend(it.token, payload)
+        : (apnsReady() ? apnsSend(it.token, payload, cache) : Promise.resolve({ status: -1, reason: "no apns key" }))));
       for (let k = 0; k < part.length; k++) {
         const r = rs[k], it = part[k];
         if (r.status === 200) { sent++; continue; }
+        if (r.status === -1) continue;   // آيفون ومفتاح Apple لسه مش متحط
         failed++;
         if (r.status === 410 || r.reason === "Unregistered" || r.reason === "BadDeviceToken" || r.reason === "DeviceTokenNotForTopic") {
           await removePushToken(it.uid, it.token);
@@ -910,7 +943,8 @@ function tokensOfDoc(doc) {
   for (const tok of Object.keys(toks)) {
     const f = ((toks[tok] || {}).mapValue || {}).fields || {};
     const p = (f.p && f.p.stringValue) || "ios";
-    if (p === "ios" && /^[0-9a-f]{32,200}$/i.test(tok)) out.push({ uid, token: tok });
+    if (p === "ios" && /^[0-9a-f]{32,200}$/i.test(tok)) out.push({ uid, token: tok, p });
+    else if (p === "android" && /^[A-Za-z0-9_:\-]{32,400}$/.test(tok)) out.push({ uid, token: tok, p });
   }
   return out;
 }
@@ -965,7 +999,7 @@ async function removePushToken(uid, tok) {
 
 async function pushNewCertsToAdmins(n) {
   if (!n) return { sent: 0 };
-  if (!apnsReady()) return { sent: 0, skipped: "no apns key" };
+  if (!pushReady()) return { sent: 0, skipped: "no push" };
   return pushToDevices(await adminPushTokens(), {
     aps: { alert: { title: "📄 لوحات تثبيت جديدة (" + n + ")" }, sound: "default" },
     tab: "cert"
@@ -994,12 +1028,13 @@ app.post("/api/push/register", async (req, res) => {
   try {
     const uid = await uidFromReq(req);
     if (!uid) return res.status(401).json({ ok: false, error: "auth" });
-    const tok = String((req.body && req.body.token) || "").toLowerCase();
-    if (!/^[0-9a-f]{32,200}$/.test(tok)) return res.status(400).json({ ok: false, error: "token" });
+    const plat = String((req.body && req.body.platform) || "ios") === "android" ? "android" : "ios";
+    const tok = plat === "android" ? String((req.body && req.body.token) || "") : String((req.body && req.body.token) || "").toLowerCase();
+    if (plat === "ios" ? !/^[0-9a-f]{32,200}$/.test(tok) : !/^[A-Za-z0-9_:\-]{32,400}$/.test(tok)) return res.status(400).json({ ok: false, error: "token" });
     const on = !(req.body && req.body.on === false);
     const mask = "updateMask.fieldPaths=" + encodeURIComponent("pushTokens.`" + tok + "`") + "&currentDocument.exists=true";
     const body = on ? { fields: { pushTokens: { mapValue: { fields: { [tok]: { mapValue: { fields: {
-      p: { stringValue: "ios" },
+      p: { stringValue: plat },
       at: { stringValue: new Date().toISOString() },
       label: { stringValue: String((req.body && req.body.label) || "").slice(0, 80) }
     } } } } } } } } : { fields: {} };
@@ -1009,7 +1044,7 @@ app.post("/api/push/register", async (req, res) => {
       body: JSON.stringify(body)
     });
     if (!r.ok) return res.status(500).json({ ok: false, error: "save HTTP " + r.status });
-    res.json({ ok: true, push: apnsReady() });
+    res.json({ ok: true, push: plat === "android" ? true : apnsReady() });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
   }
@@ -1028,7 +1063,7 @@ app.post("/api/push/post", async (req, res) => {
     const post = await fsGetDoc("announcements/" + id);
     if (!post) return res.status(404).json({ ok: false, error: "post not found" });
     if (fv(post, "pushedAt")) return res.json({ ok: true, skipped: "already sent" });
-    if (!apnsReady()) return res.json({ ok: true, sent: 0, skipped: "no apns key" });
+    if (!pushReady()) return res.json({ ok: true, sent: 0, skipped: "no push" });
 
     // نعلّم الإشعار إنه اتبعت الأول (عشان مايتبعتش مرتين لو الطلب اتكرر)
     await fetch(FS_DOCS + "/announcements/" + id + "?updateMask.fieldPaths=pushedAt&currentDocument.exists=true", {
@@ -1146,12 +1181,12 @@ async function createAutoReports(byCompany) {
   }
   // إشعار واحد لكل المشتركين (ستارة الآيفون) بأسماء الشركات اللي نزلها تقرير
   let push = null;
-  if (made && apnsReady()) {
+  if (made && pushReady()) {
     try {
       let docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
       docs = docs.filter((d) => fv(d, "status") !== "paused");
       push = await pushToDevices(docs.flatMap(tokensOfDoc), {
-        aps: { alert: { title: "📊 تقرير يومي جديد: " + cos.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" },
+        aps: { alert: { title: "📊 نزلت شهادات جديدة في التقارير اليومية: " + cos.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" },
         tab: "cert"
       });
     } catch (e) { push = { error: String((e && e.message) || e).slice(0, 150) }; }
@@ -1358,7 +1393,7 @@ async function autoRunOnce() {
   todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
   const queue = todo.slice(0, AUTO_MAX_PER_RUN);
 
-  let processed = 0, plates = 0, lessors = 0, fresh = 0;
+  let processed = 0, plates = 0, lessors = 0, fresh = 0, freshHidden = 0;
   const repAdd = {};   // الشركة -> لوحات جديدة للتقرير اليومي
   const CHUNK = 9;
   for (let i = 0; i < queue.length; i += CHUNK) {
@@ -1380,7 +1415,8 @@ async function autoRunOnce() {
       if (p) plates++;
       if (l) lessors++;
       (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
-      if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة (للإشعار)
+      if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة
+      if (!it.prev && !(p && l)) freshHidden++;   // جديدة ومادخلتش التقارير -> إشعار للأدمن
       // اللوحة والشركة اتقروا الاتنين لأول مرة في الجولة دي -> تدخل التقرير اليومي (مرة واحدة بس)
       const fAge = Date.now() - (Date.parse(it.f.createdTime || it.f.modifiedTime || "") || Date.now());
       if (AUTO_REPORTS && p && l && !(prev.p && prev.l) && fAge <= AUTO_REPORT_MAX_AGE_MS) {
@@ -1392,7 +1428,7 @@ async function autoRunOnce() {
     for (const d of Object.keys(save)) await fsSaveDay(d, save[d]);
   }
   let push = null;
-  try { push = await pushNewCertsToAdmins(fresh); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
+  try { push = await pushNewCertsToAdmins(freshHidden); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
   let reports = null;
   try { reports = await createAutoReports(repAdd); } catch (e) { reports = { error: String((e && e.message) || e).slice(0, 200) }; }
   const out = { listed: files.length, todo: todo.length, processed, fresh, plates, lessors, push, reports, ms: Date.now() - t0 };
