@@ -1251,6 +1251,87 @@ app.post("/api/reports/referral-hit", async (req, res) => {
   }
 });
 
+// استرجاع التقارير التلقائية اللي اتمسحت بالغلط (مرة واحدة): POST /api/reports/rebuild-auto
+// بالمفتاح السري. ?dry=1 بيعرض الأعداد بس من غير ما يكتب حاجة. ?since=ISO (الافتراضي بداية التقارير التلقائية)
+// بيرجّع لوحات الشهادات (لوحة + شركة) من certMetaDay، ومابيكررش أي لوحة موجودة في تقرير دلوقتي. من غير إشعار.
+app.post("/api/reports/rebuild-auto", async (req, res) => {
+  if (!SERVER_KEY || !keyEq(req.headers["x-server-key"] || "", SERVER_KEY)) return res.status(403).json({ ok: false, error: "forbidden" });
+  try {
+    const dry = String(req.query.dry || "") === "1";
+    const since = Date.parse(String(req.query.since || "2026-11-07T07:30:00Z"));
+    if (!isFinite(since)) return res.status(400).json({ ok: false, error: "bad since" });
+    const hours = Math.min(96, Math.ceil((Date.now() - since) / 3600000) + 1);
+    const serverHdr = { "X-Server-Key": SERVER_KEY };
+    const lr = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/recent?hours=" + hours + "&limit=3000", { headers: serverHdr });
+    const ld = await lr.json().catch(() => null);
+    if (!lr.ok || !ld || ld.ok === false) throw new Error("list failed: HTTP " + lr.status);
+    const files = (Array.isArray(ld.files) ? ld.files : []).filter((f) => {
+      const t = Date.parse(f && (f.createdTime || f.modifiedTime) || "");
+      return f && f.id && isFinite(t) && t >= since;
+    });
+    const days = {};
+    for (const f of files) { const d = dayOf(f); (days[d] = days[d] || []).push(f); }
+    // اللوحات الموجودة في أي تقرير دلوقتي (يومي أو اللي منزلتش) -> مانكررهاش
+    const have = new Set();
+    const docs = await fsRunQuery({
+      from: [{ collectionId: "announcements" }],
+      where: { fieldFilter: { field: { fieldPath: "report" }, op: "EQUAL", value: { booleanValue: true } } }
+    });
+    for (const d of docs) String(fv(d, "text") || "").split(/\r?\n/).forEach((l) => { const k = plateKeyLoose(l.trim()); if (k) have.add(k); });
+    const by = {};   // الشركة -> { plates: Map(key->plate), newest }
+    let withMeta = 0, skippedHave = 0;
+    for (const d of Object.keys(days)) {
+      const st = await fsGetDay(d);
+      for (const f of days[d]) {
+        const e = st[f.id];
+        if (!e || !e.p || !e.l) continue;
+        withMeta++;
+        const k = plateKeyLoose(e.p);
+        if (!k) continue;
+        if (have.has(k)) { skippedHave++; continue; }
+        const co = reportCompanyOf(e.l);
+        if (!co) continue;
+        const g = by[co] = by[co] || { plates: new Map(), newest: 0 };
+        g.plates.set(k, e.p);
+        g.newest = Math.max(g.newest, Date.parse(f.createdTime || f.modifiedTime || "") || 0);
+      }
+    }
+    const summary = Object.keys(by).map((co) => ({ company: co, plates: by[co].plates.size }));
+    if (dry) return res.json({ ok: true, dry: true, files: files.length, withMeta, skippedHave, companies: summary });
+    let made = 0;
+    const base = Date.now();
+    const cos = Object.keys(by);
+    for (let i = 0; i < cos.length; i++) {
+      const co = cos[i];
+      const plates = Array.from(by[co].plates.values());
+      if (!plates.length) continue;
+      // وقت التقرير = وقت أحدث شهادة فيه (عشان مدة الـ24 ساعة تتحسب صح)، ومايزيدش عن دلوقتي
+      const id = String(Math.min(base, Math.max(since, by[co].newest || base)) + i);
+      const fields = {
+        text: { stringValue: plates.join("\n") },
+        id: { stringValue: id },
+        showClose: { booleanValue: true }, showSort: { booleanValue: true }, masked: { booleanValue: false }, showNote: { booleanValue: true },
+        report: { booleanValue: true }, auto: { booleanValue: true }, restored: { booleanValue: true },
+        companies: { arrayValue: { values: [{ stringValue: co }] } },
+        audience: { stringValue: "all" },
+        targets: { arrayValue: { values: [] } }, targetNames: { arrayValue: { values: [] } },
+        createdAt: { timestampValue: new Date().toISOString() }
+      };
+      const r = await fetch(FS_DOCS + "/announcements/" + id + "?currentDocument.exists=false", {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+        body: JSON.stringify({ fields })
+      });
+      if (r.ok) made++;
+      else console.log("[rebuild-auto] save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+    }
+    console.log("[rebuild-auto] " + JSON.stringify({ made, summary }));
+    res.json({ ok: true, made, companies: summary, skippedHave });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
 async function autoRunOnce() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
