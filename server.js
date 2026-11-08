@@ -1172,9 +1172,9 @@ function plateFromFileName(name) {
 const AUTO_REPORT_MAX_AGE_MS = 24 * 3600 * 1000;   // التقرير اليومي: شهادات آخر 24 ساعة بس
 
 /* ============================================================
-   «الشهادات اللي منزلتش في الإحالات»: أي مشترك محمّل ملف إحالة ولقى فيه لوحات من التقرير،
-   التطبيق بيبعتها هنا والسيرفر بيشيلها من التقارير نهائي (عند كل الناس، ومن ضمنهم الأدمن).
-   - لازم حساب مسجّل ومش موقوف
+   «الشهادات اللي منزلتش في الإحالات»: الأدمن الرئيسي محمّل ملف إحالة ولقى فيه لوحات من التقرير،
+   التطبيق بيبعتها هنا والسيرفر بيشيلها من التقارير نهائي (عند كل الناس).
+   - الأدمن الرئيسي بس (isAdmin)
    - بيشيل بس اللوحات اللي اتبعتت، من التقرير اليومي و«الشهادات اللي منزلتش» الاتنين
    - الإحالة = ملفات الإحالة + اللوحات الملصوقة في كارت البحث (زرار الفرز)
    - بيتسجّل مين شال إيه في reportRefPurgeLog
@@ -1196,7 +1196,8 @@ app.post("/api/reports/referral-hit", async (req, res) => {
     const uid = await uidFromReq(req);
     if (!uid) return res.status(401).json({ ok: false, error: "auth" });
     const me = await fsGetDoc("users/" + encodeURIComponent(uid));
-    if (!me || fv(me, "status") === "paused") return res.status(403).json({ ok: false, error: "account" });
+    // الأدمن الرئيسي بس هو اللي إحالته بتمسح من التقارير عند الكل
+    if (!me || fv(me, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
     const sent = Array.isArray(req.body && req.body.plates) ? req.body.plates.slice(0, 3000) : [];
     const keys = new Set(sent.map(plateKeyLoose).filter(Boolean));
     if (!keys.size) return res.json({ ok: true, removed: 0 });
