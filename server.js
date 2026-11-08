@@ -1171,6 +1171,85 @@ function plateFromFileName(name) {
 
 const AUTO_REPORT_MAX_AGE_MS = 24 * 3600 * 1000;   // التقرير اليومي: شهادات آخر 24 ساعة بس
 
+/* ============================================================
+   «الشهادات اللي منزلتش في الإحالات»: أي مشترك محمّل ملف إحالة ولقى فيه لوحات من التقرير،
+   التطبيق بيبعتها هنا والسيرفر بيشيلها من التقارير نهائي (عند كل الناس، ومن ضمنهم الأدمن).
+   - لازم حساب مسجّل ومش موقوف
+   - بيشيل بس اللوحات اللي اتبعتت (ومن تقارير عدّى عليها 24 ساعة = اللي في التقرير ده)
+   - بيتسجّل مين شال إيه في reportRefPurgeLog
+   ============================================================ */
+function plateKeyLoose(s) {
+  let n = String(s || "")
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[ً-ٰٟـ]/g, "")
+    .replace(/[أإآ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي")
+    .replace(/[\s,،\-_.]+/g, "");
+  const m = n.match(/^([^\d]+)(\d{1,4})$/);
+  if (!m) return "";
+  return m[1] + m[2].padStart(4, "0");
+}
+
+app.post("/api/reports/referral-hit", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me || fv(me, "status") === "paused") return res.status(403).json({ ok: false, error: "account" });
+    const sent = Array.isArray(req.body && req.body.plates) ? req.body.plates.slice(0, 3000) : [];
+    const keys = new Set(sent.map(plateKeyLoose).filter(Boolean));
+    if (!keys.size) return res.json({ ok: true, removed: 0 });
+
+    const docs = await fsRunQuery({
+      from: [{ collectionId: "announcements" }],
+      where: { fieldFilter: { field: { fieldPath: "report" }, op: "EQUAL", value: { booleanValue: true } } }
+    });
+    const DAY = 24 * 3600 * 1000;
+    let removed = 0, touched = 0;
+    const removedPlates = [];
+    for (const d of docs) {
+      const id = String(d.name || "").split("/").pop();
+      const t = Number(fv(d, "id") || id);
+      if (!(isFinite(t) && t > 1e12 && Date.now() - t > DAY)) continue;   // لسه في اليومي
+      const text = String(fv(d, "text") || "");
+      const lines = text.split(/\r?\n/);
+      const keep = lines.filter((l) => {
+        const k = plateKeyLoose(l.trim());
+        if (k && keys.has(k)) { removedPlates.push(l.trim()); return false; }
+        return true;
+      });
+      if (keep.length === lines.length) continue;
+      removed += lines.length - keep.length;
+      touched++;
+      const hdr = { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" };
+      const docUrl = FS_DOCS + "/announcements/" + encodeURIComponent(id);
+      if (keep.some((l) => /\d/.test(l))) {
+        await fetch(docUrl + "?updateMask.fieldPaths=text&currentDocument.exists=true", {
+          method: "PATCH", headers: hdr, body: JSON.stringify({ fields: { text: { stringValue: keep.join("\n").trim() } } })
+        });
+      } else {
+        await fetch(docUrl, { method: "DELETE", headers: hdr });
+      }
+    }
+    if (removed) {
+      const logId = Date.now() + "-" + uid.slice(0, 8);
+      await fetch(FS_DOCS + "/reportRefPurgeLog/" + logId, {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: {
+          uid: { stringValue: uid },
+          email: { stringValue: String(fv(me, "email") || "") },
+          plates: { arrayValue: { values: removedPlates.slice(0, 500).map((x) => ({ stringValue: x })) } },
+          at: { timestampValue: new Date().toISOString() }
+        } })
+      }).catch(() => {});
+    }
+    res.json({ ok: true, removed, reports: touched });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
 async function autoRunOnce() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
