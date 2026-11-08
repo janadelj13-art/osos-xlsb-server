@@ -1175,7 +1175,8 @@ const AUTO_REPORT_MAX_AGE_MS = 24 * 3600 * 1000;   // التقرير اليوم�
    «الشهادات اللي منزلتش في الإحالات»: أي مشترك محمّل ملف إحالة ولقى فيه لوحات من التقرير،
    التطبيق بيبعتها هنا والسيرفر بيشيلها من التقارير نهائي (عند كل الناس، ومن ضمنهم الأدمن).
    - لازم حساب مسجّل ومش موقوف
-   - بيشيل بس اللوحات اللي اتبعتت (ومن تقارير عدّى عليها 24 ساعة = اللي في التقرير ده)
+   - بيشيل بس اللوحات اللي اتبعتت، من التقرير اليومي و«الشهادات اللي منزلتش» الاتنين
+   - الإحالة = ملفات الإحالة + اللوحات الملصوقة في كارت البحث (زرار الفرز)
    - بيتسجّل مين شال إيه في reportRefPurgeLog
    ============================================================ */
 function plateKeyLoose(s) {
@@ -1204,13 +1205,12 @@ app.post("/api/reports/referral-hit", async (req, res) => {
       from: [{ collectionId: "announcements" }],
       where: { fieldFilter: { field: { fieldPath: "report" }, op: "EQUAL", value: { booleanValue: true } } }
     });
-    const DAY = 24 * 3600 * 1000;
     let removed = 0, touched = 0;
     const removedPlates = [];
     for (const d of docs) {
       const id = String(d.name || "").split("/").pop();
       const t = Number(fv(d, "id") || id);
-      if (!(isFinite(t) && t > 1e12 && Date.now() - t > DAY)) continue;   // لسه في اليومي
+      if (!(isFinite(t) && t > 1e12)) continue;   // اليومي و«الشهادات اللي منزلتش» الاتنين
       const text = String(fv(d, "text") || "");
       const lines = text.split(/\r?\n/);
       const keep = lines.filter((l) => {
