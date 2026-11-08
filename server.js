@@ -1078,6 +1078,11 @@ const AUTO_REPORTS = String(process.env.AUTO_REPORTS || "1") !== "0";
 // نفس قايمة التطبيق (index.html: REPORT_COMPANIES)
 const REPORT_COMPANIES = ["البنك الأهلي السعودي", "شركة الجبر للتمويل", "شركة راية للتمويل", "مصرف الراجحي", "شركة عبداللطيف جميل المتحدة", "شركة التيسير العربية للتمويل", "الفرنسي للتأجير", "شركة إيجارة للتمويل", "بنك البلاد", "الإمارات", "تأجير تمويلي", "جبر تمويلي", "بنك الرياض", "مصرف الإنماء", "بنك الجزيرة", "البنك العربي الوطني", "شركة امكان للتمويل"];
 
+// الاسم الرسمي في الشهادة -> كارت الشركة في التقارير
+const REPORT_ALIASES = [
+  ["الراجحي", "مصرف الراجحي"]   // "شركة الراجحي المصرفية للاستثمار" = مصرف الراجحي
+];
+
 function coNorm(s) {
   return String(s || "")
     .replace(/[ً-ٰٟـ]/g, "")
@@ -1092,6 +1097,8 @@ function reportCompanyOf(lessor) {
   if (!raw) return "";
   const n = coNorm(raw);
   if (n.length < 3) return "";
+  // أسماء رسمية مختلفة عن اسم الكارت (متأكدين منها)
+  for (const [k, co] of REPORT_ALIASES) if (n.includes(coNorm(k))) return co;
   let best = "", bestLen = 0;
   for (const c of REPORT_COMPANIES) {
     const cn = coNorm(c);
