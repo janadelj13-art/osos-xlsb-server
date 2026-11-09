@@ -1507,13 +1507,18 @@ app.post("/api/vin/read", async (req, res) => {
     const mime = /^image\/(jpeg|png|webp)$/.test(String(req.body && req.body.mime)) ? req.body.mime : "image/jpeg";
     if (b64.length < 1000 || b64.length > 7_500_000 || !/^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0, 2000))) return res.status(400).json({ ok: false, error: "image" });
     const t0 = Date.now();
+    // الأول الموديل الأرخص. لو فشل أو مالقاش رقم سليم (17 خانة وخانة التأكيد صح) -> الموديل الأقوى
+    // (Haiku بيفوّت الأرقام الصغيرة/المتربة -- تجربة 9/11: لقى رقم في 2 من 9 صور)
+    const goodIn = (arr) => arr.some((x) => { const v = vinClean(String(x || "").replace(/\?/g, "")); return v.length === 17 && vinCheckOk(v); });
     let raw = [], model = VIN_MODEL;
     try { raw = await visionReadVin(VIN_MODEL, b64, mime); }
     catch (e) {
       if (!VIN_MODEL_2 || VIN_MODEL_2 === VIN_MODEL) throw e;
       console.log("⚠️ vin: " + String((e && e.message) || e).slice(0, 160) + " -- بنجرب " + VIN_MODEL_2);
-      model = VIN_MODEL_2;
-      raw = await visionReadVin(VIN_MODEL_2, b64, mime);
+    }
+    if (!goodIn(raw) && VIN_MODEL_2 && VIN_MODEL_2 !== VIN_MODEL) {
+      try { raw = (await visionReadVin(VIN_MODEL_2, b64, mime)).concat(raw); model = VIN_MODEL_2; }
+      catch (e) { if (!raw.length) throw e; console.log("⚠️ vin " + VIN_MODEL_2 + ": " + String((e && e.message) || e).slice(0, 160)); }
     }
     const seen = new Set();
     const vins = [];
