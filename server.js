@@ -725,8 +725,11 @@ const SERVER_KEY = process.env.SERVER_KEY || "";
 const FS_PROJECT = process.env.FIRESTORE_PROJECT || "jta-cloud-daeb1";
 const FS_BASE = "https://firestore.googleapis.com/v1/projects/" + FS_PROJECT + "/databases/(default)/documents/certMetaDay/";
 const AUTO_HOURS = 72;          // بنراجع آخر 72 ساعة
-const AUTO_MAX_PER_RUN = 120;   // أقصى عدد شهادات في الجولة الواحدة (الباقي في الجولة اللي بعدها)
-const AUTO_BUDGET_MS = 200000;  // نوقف قبل مهلة الطلب
+// الجولة بتفضل شغالة لحد ما تخلّص كل الشهادات الجديدة (مش 120 وتستنى الجولة الجاية)،
+// بس بتقف قبل مهلة الطلب في Cloud Run (لازم --timeout=900). الباقي -- لو فضل -- في الجولة اللي بعدها.
+const AUTO_MAX_PER_RUN = Math.max(50, Number(process.env.AUTO_MAX_PER_RUN || 5000));
+const AUTO_BUDGET_MS = Math.max(60000, Number(process.env.AUTO_BUDGET_MS || 780000));   // 13 دقيقة
+const AUTO_FLUSH_MS = 120000;   // كل دقيقتين: اللي اتقرا يتضاف للتقارير على طول (مايستناش آخر الجولة)
 const AUTO_MAX_ATTEMPTS = 3;
 let autoRunning = false;
 let gcpTok = { v: "", exp: 0 };
@@ -765,7 +768,9 @@ async function fsGetDay(day) {
       p: (f.p && f.p.stringValue) || "",
       l: (f.l && f.l.stringValue) || "",
       c: (f.c && f.c.stringValue) || "",
-      a: Number((f.a && f.a.integerValue) || 0)
+      a: Number((f.a && f.a.integerValue) || 0),
+      // r: 1 = اتضافت للتقرير، 0 = مستنية تتضاف، -1 = قديمة (قبل الحقل ده -- بنعتبرها اتضافت)
+      r: (f.r && f.r.integerValue != null) ? Number(f.r.integerValue) : -1
     };
   }
   return out;
@@ -781,7 +786,8 @@ async function fsSaveDay(day, entries) {
       p: { stringValue: e.p || "" },
       l: { stringValue: e.l || "" },
       c: { stringValue: e.c || "" },
-      a: { integerValue: String(e.a || 0) }
+      a: { integerValue: String(e.a || 0) },
+      r: { integerValue: String(e.r == null ? -1 : e.r) }
     } } };
   }
   const mask = ids.map((id) => "updateMask.fieldPaths=" + encodeURIComponent("m.`" + id.replace(/`/g, "") + "`")).join("&");
@@ -1150,7 +1156,8 @@ function reportCompanyOf(lessor) {
   return best || raw;
 }
 
-async function createAutoReports(byCompany) {
+async function createAutoReports(byCompany, opts) {
+  const doPush = !opts || opts.push !== false;   // في الجولة الطويلة: إشعار مع أول إضافة بس
   const cos = Object.keys(byCompany);
   if (!cos.length) return { reports: 0 };
   const base = Date.now();
@@ -1186,7 +1193,7 @@ async function createAutoReports(byCompany) {
   }
   // إشعار واحد لكل المشتركين (ستارة الآيفون) بأسماء الشركات اللي نزلها تقرير
   let push = null;
-  if (made && pushReady()) {
+  if (made && doPush && pushReady()) {
     try {
       let docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
       docs = docs.filter((d) => fv(d, "status") !== "paused");
@@ -1376,7 +1383,29 @@ app.post("/api/reports/rebuild-auto", async (req, res) => {
   }
 });
 
+// قفل بسيط في Firestore: جولة واحدة بس في نفس الوقت (حتى لو Cloud Run فتح نسختين)
+async function autoLock(ms) {
+  const url = FS_DOCS + "/serverState/autoRun";
+  const hdr = { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" };
+  try {
+    const g = await fetch(url, { headers: hdr });
+    if (g.ok) { const d = await g.json(); const until = Number((((d.fields || {}).until || {}).integerValue) || 0); if (until > Date.now()) return false; }
+  } catch (e) {}
+  const r = await fetch(url + "?updateMask.fieldPaths=until", { method: "PATCH", headers: hdr, body: JSON.stringify({ fields: { until: { integerValue: String(Date.now() + ms) } } }) });
+  return r.ok;
+}
+async function autoUnlock() {
+  try {
+    await fetch(FS_DOCS + "/serverState/autoRun?updateMask.fieldPaths=until", { method: "PATCH", headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" }, body: JSON.stringify({ fields: { until: { integerValue: "0" } } }) });
+  } catch (e) {}
+}
+
 async function autoRunOnce() {
+  if (!(await autoLock(AUTO_BUDGET_MS + 120000))) return { skipped: "locked" };
+  try { return await autoRunBody(); } finally { await autoUnlock(); }
+}
+
+async function autoRunBody() {
   const t0 = Date.now();
   const serverHdr = { "X-Server-Key": SERVER_KEY };
   const lr = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/recent?hours=" + AUTO_HOURS + "&limit=3000", { headers: serverHdr });
@@ -1399,19 +1428,41 @@ async function autoRunOnce() {
       // لوحة من اسم الملف (من غير ما نفتحه): لو اتقرت دلوقتي ومكانتش متسجلة -> ترجع تتعالج حتى لو المحاولات خلصت
       // (شهادات «9272 د ه أ.pdf» و«... (1).pdf» كانت بتتساب من غير لوحة)
       const fp = needsOpenName(f.name) ? "" : plateFromFileName(f.name);
-      if (!e || ((!e.p || !e.l) && e.a < AUTO_MAX_ATTEMPTS) || (!e.p && fp)) todo.push({ f, d, prev: e || null, fp });
+      // اتقرت (لوحة + شركة) بس لسه ماتضافتش للتقرير (الجولة اللي فاتت اتقطعت قبل ما تضيفها)
+      const fAge = Date.now() - (Date.parse(f.createdTime || f.modifiedTime || "") || Date.now());
+      const pendingRep = !!(e && e.p && e.l && e.r === 0 && fAge <= AUTO_REPORT_MAX_AGE_MS);
+      if (!e || ((!e.p || !e.l) && e.a < AUTO_MAX_ATTEMPTS) || (!e.p && fp) || pendingRep) todo.push({ f, d, prev: e || null, fp, pendingRep });
     }
   }
   todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
   const queue = todo.slice(0, AUTO_MAX_PER_RUN);
 
   let processed = 0, plates = 0, lessors = 0, fresh = 0, freshHidden = 0;
-  const repAdd = {};   // الشركة -> لوحات جديدة للتقرير اليومي
+  let repAdd = {};     // الشركة -> لوحات جديدة للتقرير اليومي (من آخر إضافة)
+  let repIds = [];     // الشهادات اللي في repAdd: [{ d, id, e }] -> بعد ما تتضاف بنعلّمها r=1
+  const reportsOut = [];
+  let lastFlush = Date.now(), pushedOnce = false;
+  async function flushReports() {
+    if (!Object.keys(repAdd).length) return;
+    const add = repAdd, ids = repIds;
+    repAdd = {}; repIds = [];
+    let rr = null;
+    try { rr = await createAutoReports(add, { push: !pushedOnce }); } catch (e) { rr = { error: String((e && e.message) || e).slice(0, 200) }; }
+    reportsOut.push(rr);
+    if (rr && rr.reports) {
+      pushedOnce = true;
+      const byDay = {};
+      ids.forEach((x) => { (byDay[x.d] = byDay[x.d] || {})[x.id] = Object.assign({}, x.e, { r: 1 }); });
+      for (const d of Object.keys(byDay)) { try { await fsSaveDay(d, byDay[d]); } catch (e) {} }
+    }
+    lastFlush = Date.now();
+  }
   const CHUNK = 9;
   for (let i = 0; i < queue.length; i += CHUNK) {
     if (Date.now() - t0 > AUTO_BUDGET_MS) break;
     const chunk = queue.slice(i, i + CHUNK);
     const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, async (it) => {
+      if (it.pendingRep) return { plate: it.prev.p, lessor: { name: it.prev.l, cr: it.prev.c || null } };
       if (needsOpenName(it.f.name)) return resolveOnePlate(it.f.id, "both", serverHdr);
       // اسم الشركة متقري قبل كده واللوحة من الاسم -> مش محتاجين نفتح الملف
       if (it.prev && it.prev.l && it.fp) return { plate: it.fp, lessor: { name: it.prev.l, cr: it.prev.c || null } };
@@ -1428,24 +1479,31 @@ async function autoRunOnce() {
       const c = (r && r.lessor && r.lessor.cr) || prev.c || "";
       if (p) plates++;
       if (l) lessors++;
-      (save[it.d] = save[it.d] || {})[it.f.id] = { p, l, c, a: prev.a + 1 };
       if (!it.prev) fresh++;   // أول مرة تتشاف = شهادة جديدة
       if (!it.prev && !(p && l)) freshHidden++;   // جديدة ومادخلتش التقارير -> إشعار للأدمن
-      // اللوحة والشركة اتقروا الاتنين لأول مرة في الجولة دي -> تدخل التقرير اليومي (مرة واحدة بس)
+      // اللوحة والشركة اتقروا الاتنين ومادخلوش تقرير قبل كده -> التقرير اليومي (مرة واحدة بس)
       const fAge = Date.now() - (Date.parse(it.f.createdTime || it.f.modifiedTime || "") || Date.now());
-      if (AUTO_REPORTS && p && l && !(prev.p && prev.l) && fAge <= AUTO_REPORT_MAX_AGE_MS) {
+      const reportedBefore = !!(it.prev && prev.p && prev.l && prev.r !== 0);
+      let added = false;
+      if (AUTO_REPORTS && p && l && !reportedBefore && fAge <= AUTO_REPORT_MAX_AGE_MS) {
         const co = reportCompanyOf(l);
-        if (co) (repAdd[co] = repAdd[co] || []).push(p);
+        if (co) { (repAdd[co] = repAdd[co] || []).push(p); added = true; }
       }
+      // r: 0 = مستنية تتضاف (بتتعلّم 1 بعد ما التقرير يتحفظ)، غير كده 1 (خلصت أو مش هتدخل تقرير)
+      const rf = added ? 0 : (reportedBefore ? prev.r : (p && l ? 1 : 0));
+      const entry = { p, l, c, a: it.pendingRep ? prev.a : prev.a + 1, r: rf };
+      (save[it.d] = save[it.d] || {})[it.f.id] = entry;
+      if (added) repIds.push({ d: it.d, id: it.f.id, e: entry });
       processed++;
     });
     for (const d of Object.keys(save)) await fsSaveDay(d, save[d]);
+    if (Date.now() - lastFlush >= AUTO_FLUSH_MS) await flushReports();
   }
+  await flushReports();
   let push = null;
   try { push = await pushNewCertsToAdmins(freshHidden); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
-  let reports = null;
-  try { reports = await createAutoReports(repAdd); } catch (e) { reports = { error: String((e && e.message) || e).slice(0, 200) }; }
-  const out = { listed: files.length, todo: todo.length, processed, fresh, plates, lessors, push, reports, ms: Date.now() - t0 };
+  const reports = reportsOut.length ? { flushes: reportsOut.length, reports: reportsOut.reduce((n, x) => n + ((x && x.reports) || 0), 0), last: reportsOut[reportsOut.length - 1] } : { reports: 0 };
+  const out = { listed: files.length, todo: todo.length, processed, left: Math.max(0, todo.length - processed), fresh, plates, lessors, push, reports, ms: Date.now() - t0 };
   console.log("[auto-run] " + JSON.stringify(out));
   return out;
 }
