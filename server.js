@@ -1466,7 +1466,6 @@ async function visionReadVin(model, b64, mime) {
     body: JSON.stringify({
       model,
       max_tokens: 200,
-      temperature: 0,
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: mime, data: b64 } },
         { type: "text", text:
