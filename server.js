@@ -1119,6 +1119,7 @@ const REPORT_ALIASES = [
   ["الراجحي", "مصرف الراجحي"],   // "شركة الراجحي المصرفية للاستثمار" = مصرف الراجحي
   // «تمويل الأولى»: الـ PDF بيطلّع «لا» مقلوبة والـ «ى» بتضيع -> «تمويل االول»
   ["تمويل االول", "تمويل الأولى"],
+  ["تمويل االوىل", "تمويل الأولى"],   // ده اللي السيرفر بيقراه فعلًا (certMetaDay 9/11)
   ["تمويل الاول", "تمويل الأولى"]
 ];
 
@@ -1205,8 +1206,11 @@ function plateFromFileName(name) {
   // «د ص ط 5508 (1).pdf»: الـ (1) اللي بيضيفها الموبايل لما الملف يتنزل مرتين بنشيلها
   let n = String(name || "").replace(/\.pdf$/i, "").replace(/\s*\(\d{1,3}\)\s*$/, "").replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
   n = englishPlateToArabic(n);
-  const m = n.match(/^([\u0621-\u064A])\s?([\u0621-\u064A])\s?([\u0621-\u064A])\s?(\d{1,4})$/);
-  return m ? (m[1] + m[2] + m[3] + " " + m[4]) : "";
+  let m = n.match(/^([\u0621-\u064A])\s?([\u0621-\u064A])\s?([\u0621-\u064A])\s?(\d{1,4})$/);
+  if (m) return m[1] + m[2] + m[3] + " " + m[4];
+  // «9272 د ه أ.pdf»: الرقم الأول (زي ما التطبيق بيقراه بالظبط)
+  m = n.match(/^(\d{1,4})\s?([\u0621-\u064A])\s?([\u0621-\u064A])\s?([\u0621-\u064A])$/);
+  return m ? (m[2] + m[3] + m[4] + " " + m[1]) : "";
 }
 
 const AUTO_REPORT_MAX_AGE_MS = 24 * 3600 * 1000;   // التقرير اليومي: شهادات آخر 24 ساعة بس
@@ -1392,7 +1396,10 @@ async function autoRunOnce() {
   for (const d of Object.keys(days)) {
     for (const f of days[d]) {
       const e = state[d][f.id];
-      if (!e || ((!e.p || !e.l) && e.a < AUTO_MAX_ATTEMPTS)) todo.push({ f, d, prev: e || null });
+      // لوحة من اسم الملف (من غير ما نفتحه): لو اتقرت دلوقتي ومكانتش متسجلة -> ترجع تتعالج حتى لو المحاولات خلصت
+      // (شهادات «9272 د ه أ.pdf» و«... (1).pdf» كانت بتتساب من غير لوحة)
+      const fp = needsOpenName(f.name) ? "" : plateFromFileName(f.name);
+      if (!e || ((!e.p || !e.l) && e.a < AUTO_MAX_ATTEMPTS) || (!e.p && fp)) todo.push({ f, d, prev: e || null, fp });
     }
   }
   todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
@@ -1406,6 +1413,8 @@ async function autoRunOnce() {
     const chunk = queue.slice(i, i + CHUNK);
     const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, async (it) => {
       if (needsOpenName(it.f.name)) return resolveOnePlate(it.f.id, "both", serverHdr);
+      // اسم الشركة متقري قبل كده واللوحة من الاسم -> مش محتاجين نفتح الملف
+      if (it.prev && it.prev.l && it.fp) return { plate: it.fp, lessor: { name: it.prev.l, cr: it.prev.c || null } };
       // اسم الملف هو اللوحة: نقرا اسم الشركة بس (أسرع)
       const r = await resolveOnePlate(it.f.id, "lessor", serverHdr);
       return Object.assign({}, r || {}, { plate: plateFromFileName(it.f.name) || (r && r.plate) || null });
