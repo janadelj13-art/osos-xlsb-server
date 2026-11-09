@@ -1483,6 +1483,8 @@ async function visionReadVin(model, b64, mime) {
   const m = /\{[\s\S]*\}/.exec(out);
   let j = null; try { j = m ? JSON.parse(m[0]) : null; } catch (e) {}
   const raw = (j && Array.isArray(j.vins)) ? j.vins : (out.match(/[A-Z0-9?]{11,17}/gi) || []);
+  // لو مالقاش رقم: نكتب رد القارئ في اللوج (من غير الصورة) عشان نعرف ليه
+  if (!raw.length) console.log("🔎 vin رد فاضي (" + model + ", " + ((d && d.stop_reason) || "") + "): " + out.replace(/\s+/g, " ").slice(0, 300));
   return raw.map((x) => String(x || ""));
 }
 
