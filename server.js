@@ -1443,8 +1443,9 @@ async function autoRunOnce() {
    المفتاح في المتغير VISION_API_KEY على السيرفر بس -- عمره ما بيروح للتطبيق.
    الصورة مش بتتحفظ ولا بتتكتب في اللوج. */
 const VISION_API_KEY = String(process.env.VISION_API_KEY || "").trim();
-const VIN_MODEL = String(process.env.VIN_MODEL || "claude-haiku-5-5").trim();
-const VIN_MODEL_2 = String(process.env.VIN_MODEL_2 || "claude-sonnet-5-5").trim();   // لو الأول رفض/فشل
+// الموديلات بالترتيب من الأرخص للأقوى: بنبدأ بالأول، ولو مالقاش رقم سليم بنطلع للي بعده
+const VIN_MODELS = String(process.env.VIN_MODELS || "claude-haiku-5-5,claude-sonnet-5-5,claude-opus-5-5")
+  .split(",").map((x) => x.trim()).filter(Boolean);
 const VIN_PER_HOUR = Math.max(10, Number(process.env.VIN_PER_HOUR || 300));         // حد لكل حساب في الساعة
 const vinUse = new Map();                                                           // uid -> [أوقات]
 const VIN_MAP = { A:1,B:2,C:3,D:4,E:5,F:6,G:7,H:8,J:1,K:2,L:3,M:4,N:5,P:7,R:9,S:2,T:3,U:4,V:5,W:6,X:7,Y:8,Z:9 };
@@ -1459,13 +1460,17 @@ function vinCheckOk(v) {
 function vinClean(t) {
   return String(t || "").toUpperCase().replace(/O/g, "0").replace(/Q/g, "0").replace(/I/g, "1").replace(/[^A-HJ-NPR-Z0-9]/g, "");
 }
+const vinNoThink = {};                                                              // موديل رفض إعداد التفكير -> مانبعتهوش تاني
 async function visionReadVin(model, b64, mime) {
+  // الموديلات الجديدة بتفكر قبل ما ترد، والتفكير بياكل من max_tokens (كانت 200 فالرد كان بيطلع فاضي
+  // stop_reason=max_tokens). بنقفل التفكير ونسيب مساحة كفاية للرد.
+  const think = !vinNoThink[model];
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": VISION_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({
+    body: JSON.stringify(Object.assign({
       model,
-      max_tokens: 200,
+      max_tokens: 1500,
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: mime, data: b64 } },
         { type: "text", text:
@@ -1474,9 +1479,10 @@ async function visionReadVin(model, b64, mime) {
           "If a character is unreadable put ? in its place. If there are two different VINs, give both. " +
           "Reply with JSON only, no other text: {\"vins\":[\"...\"]}  -- or {\"vins\":[]} if there is no VIN in the photo." }
       ] }]
-    })
+    }, think ? { thinking: { type: "disabled" } } : {}))
   });
   const txt = await r.text();
+  if (!r.ok && r.status === 400 && think && /thinking/i.test(txt)) { vinNoThink[model] = true; return visionReadVin(model, b64, mime); }
   if (!r.ok) throw new Error("vision HTTP " + r.status + " " + txt.slice(0, 160));
   let d = null; try { d = JSON.parse(txt); } catch (e) {}
   const out = String(((d && d.content) || []).map((c) => c.text || "").join(" "));
@@ -1507,19 +1513,15 @@ app.post("/api/vin/read", async (req, res) => {
     const mime = /^image\/(jpeg|png|webp)$/.test(String(req.body && req.body.mime)) ? req.body.mime : "image/jpeg";
     if (b64.length < 1000 || b64.length > 7_500_000 || !/^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0, 2000))) return res.status(400).json({ ok: false, error: "image" });
     const t0 = Date.now();
-    // الأول الموديل الأرخص. لو فشل أو مالقاش رقم سليم (17 خانة وخانة التأكيد صح) -> الموديل الأقوى
-    // (Haiku بيفوّت الأرقام الصغيرة/المتربة -- تجربة 9/11: لقى رقم في 2 من 9 صور)
+    // من الأرخص للأقوى: أول ما موديل يلاقي رقم سليم (17 خانة وخانة التأكيد صح) بنقف
     const goodIn = (arr) => arr.some((x) => { const v = vinClean(String(x || "").replace(/\?/g, "")); return v.length === 17 && vinCheckOk(v); });
-    let raw = [], model = VIN_MODEL;
-    try { raw = await visionReadVin(VIN_MODEL, b64, mime); }
-    catch (e) {
-      if (!VIN_MODEL_2 || VIN_MODEL_2 === VIN_MODEL) throw e;
-      console.log("⚠️ vin: " + String((e && e.message) || e).slice(0, 160) + " -- بنجرب " + VIN_MODEL_2);
+    let raw = [], model = "", lastErr = null;
+    for (const m of VIN_MODELS) {
+      try { raw = (await visionReadVin(m, b64, mime)).concat(raw); model = m; }
+      catch (e) { lastErr = e; console.log("⚠️ vin " + m + ": " + String((e && e.message) || e).slice(0, 160)); }
+      if (goodIn(raw)) break;
     }
-    if (!goodIn(raw) && VIN_MODEL_2 && VIN_MODEL_2 !== VIN_MODEL) {
-      try { raw = (await visionReadVin(VIN_MODEL_2, b64, mime)).concat(raw); model = VIN_MODEL_2; }
-      catch (e) { if (!raw.length) throw e; console.log("⚠️ vin " + VIN_MODEL_2 + ": " + String((e && e.message) || e).slice(0, 160)); }
-    }
+    if (!model && lastErr) throw lastErr;
     const seen = new Set();
     const vins = [];
     for (const x of raw) {
