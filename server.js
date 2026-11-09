@@ -29,6 +29,7 @@ const app = express();
 
 // تحديد مين مسموح له يستخدم السيرفر (حط دومين موقعك هنا بدل * لو حابب تقفلها أكتر)
 app.use(cors({ origin: "*" }));
+app.use("/api/vin/read", express.json({ limit: "8mb" })); // صورة الشاصي (base64) أكبر من 1 ميجا أحيانًا
 app.use(express.json({ limit: "1mb" })); // لازمة عشان endpoint استخراج أرقام اللوحات (بياخد JSON مش ملف)
 
 // نخزن الملف في الذاكرة مباشرة، مش على القرص أبدًا.
@@ -1435,6 +1436,102 @@ async function autoRunOnce() {
   console.log("[auto-run] " + JSON.stringify(out));
   return out;
 }
+
+/* ---------- قراية رقم الشاصي من صورة (تشيك الشاصي بالكاميرا) ----------
+   التطبيق بيبعت صورة الملصق (JPEG base64) + Firebase token -> السيرفر بيبعتها لقارئ الصور
+   ويرجّع رقم الشاصي (17 خانة) ومعاه هل خانة التأكيد (الخانة 9) مظبوطة.
+   المفتاح في المتغير VISION_API_KEY على السيرفر بس -- عمره ما بيروح للتطبيق.
+   الصورة مش بتتحفظ ولا بتتكتب في اللوج. */
+const VISION_API_KEY = String(process.env.VISION_API_KEY || "").trim();
+const VIN_MODEL = String(process.env.VIN_MODEL || "claude-haiku-5-5").trim();
+const VIN_MODEL_2 = String(process.env.VIN_MODEL_2 || "claude-sonnet-5-5").trim();   // لو الأول رفض/فشل
+const VIN_PER_HOUR = Math.max(10, Number(process.env.VIN_PER_HOUR || 300));         // حد لكل حساب في الساعة
+const vinUse = new Map();                                                           // uid -> [أوقات]
+const VIN_MAP = { A:1,B:2,C:3,D:4,E:5,F:6,G:7,H:8,J:1,K:2,L:3,M:4,N:5,P:7,R:9,S:2,T:3,U:4,V:5,W:6,X:7,Y:8,Z:9 };
+const VIN_W = [8,7,6,5,4,3,2,10,0,9,8,7,6,5,4,3,2];
+function vinCheckOk(v) {
+  if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(v)) return false;
+  let s = 0;
+  for (let i = 0; i < 17; i++) { const c = v[i]; s += (/\d/.test(c) ? +c : VIN_MAP[c]) * VIN_W[i]; }
+  const r = s % 11;
+  return (r === 10 ? "X" : String(r)) === v[8];
+}
+function vinClean(t) {
+  return String(t || "").toUpperCase().replace(/O/g, "0").replace(/Q/g, "0").replace(/I/g, "1").replace(/[^A-HJ-NPR-Z0-9]/g, "");
+}
+async function visionReadVin(model, b64, mime) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": VISION_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      max_tokens: 200,
+      temperature: 0,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mime, data: b64 } },
+        { type: "text", text:
+          "The photo shows a vehicle VIN (chassis number) label, usually seen through a dusty or reflective windshield; it may be rotated or upside down. " +
+          "Read the VIN exactly, character by character (17 characters; VINs never contain I, O or Q). Ignore other numbers (glass codes, dates, barcodes, short codes under the VIN). " +
+          "If a character is unreadable put ? in its place. If there are two different VINs, give both. " +
+          "Reply with JSON only, no other text: {\"vins\":[\"...\"]}  -- or {\"vins\":[]} if there is no VIN in the photo." }
+      ] }]
+    })
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error("vision HTTP " + r.status + " " + txt.slice(0, 160));
+  let d = null; try { d = JSON.parse(txt); } catch (e) {}
+  const out = String(((d && d.content) || []).map((c) => c.text || "").join(" "));
+  const m = /\{[\s\S]*\}/.exec(out);
+  let j = null; try { j = m ? JSON.parse(m[0]) : null; } catch (e) {}
+  const raw = (j && Array.isArray(j.vins)) ? j.vins : (out.match(/[A-Z0-9?]{11,17}/gi) || []);
+  return raw.map((x) => String(x || ""));
+}
+
+// POST /api/vin/read  { image: "<base64 jpeg>", mime?: "image/jpeg" }  (أي مشترك اشتراكه شغال)
+app.post("/api/vin/read", async (req, res) => {
+  try {
+    if (!VISION_API_KEY) return res.status(503).json({ ok: false, error: "off" });
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me) return res.status(403).json({ ok: false, error: "user" });
+    const isAdmin = fv(me, "isAdmin") === true;
+    const exp = Date.parse(String(fv(me, "expiresAt") || ""));
+    if (!isAdmin && !isNaN(exp) && exp < Date.now()) return res.status(403).json({ ok: false, error: "expired" });
+    const now = Date.now();
+    const used = (vinUse.get(uid) || []).filter((t) => now - t < 3600000);
+    if (!isAdmin && used.length >= VIN_PER_HOUR) return res.status(429).json({ ok: false, error: "limit" });
+    used.push(now); vinUse.set(uid, used);
+    const b64 = String((req.body && req.body.image) || "").replace(/^data:[^,]*,/, "");
+    const mime = /^image\/(jpeg|png|webp)$/.test(String(req.body && req.body.mime)) ? req.body.mime : "image/jpeg";
+    if (b64.length < 1000 || b64.length > 7_500_000 || !/^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0, 2000))) return res.status(400).json({ ok: false, error: "image" });
+    const t0 = Date.now();
+    let raw = [], model = VIN_MODEL;
+    try { raw = await visionReadVin(VIN_MODEL, b64, mime); }
+    catch (e) {
+      if (!VIN_MODEL_2 || VIN_MODEL_2 === VIN_MODEL) throw e;
+      console.log("⚠️ vin: " + String((e && e.message) || e).slice(0, 160) + " -- بنجرب " + VIN_MODEL_2);
+      model = VIN_MODEL_2;
+      raw = await visionReadVin(VIN_MODEL_2, b64, mime);
+    }
+    const seen = new Set();
+    const vins = [];
+    for (const x of raw) {
+      const unk = /\?/.test(x);
+      const v = vinClean(x.replace(/\?/g, ""));
+      if (!v || v.length < 6 || seen.has(v)) continue;
+      seen.add(v);
+      vins.push({ v, ok: v.length === 17 && vinCheckOk(v), unk });
+    }
+    vins.sort((a, b) => (b.ok - a.ok) || (b.v.length - a.v.length));
+    // من غير الرقم نفسه في اللوج -- بس النتيجة والوقت
+    console.log("🔎 vin [" + uid.slice(0, 6) + "] " + model + ": " + vins.length + " رقم" + (vins[0] ? (vins[0].ok ? " ✓" : " ✗") : "") + " في " + (Date.now() - t0) + "ms");
+    res.json({ ok: true, vins });
+  } catch (e) {
+    console.log("⚠️ vin: " + String((e && e.message) || e).slice(0, 200));
+    res.status(502).json({ ok: false, error: "read" });
+  }
+});
 
 // تجربة إشعار الآيفون: POST /api/push/test بنفس المفتاح السري (SERVER_KEY)
 app.post("/api/push/test", async (req, res) => {
