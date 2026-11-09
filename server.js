@@ -725,11 +725,15 @@ const SERVER_KEY = process.env.SERVER_KEY || "";
 const FS_PROJECT = process.env.FIRESTORE_PROJECT || "jta-cloud-daeb1";
 const FS_BASE = "https://firestore.googleapis.com/v1/projects/" + FS_PROJECT + "/databases/(default)/documents/certMetaDay/";
 const AUTO_HOURS = 72;          // بنراجع آخر 72 ساعة
-// الجولة بتفضل شغالة لحد ما تخلّص كل الشهادات الجديدة (مش 120 وتستنى الجولة الجاية)،
-// بس بتقف قبل مهلة الطلب في Cloud Run (لازم --timeout=900). الباقي -- لو فضل -- في الجولة اللي بعدها.
-const AUTO_MAX_PER_RUN = Math.max(50, Number(process.env.AUTO_MAX_PER_RUN || 5000));
-const AUTO_BUDGET_MS = Math.max(60000, Number(process.env.AUTO_BUDGET_MS || 780000));   // 13 دقيقة
-const AUTO_FLUSH_MS = 120000;   // كل دقيقتين: اللي اتقرا يتضاف للتقارير على طول (مايستناش آخر الجولة)
+// مفيش حد لعدد الشهادات: الجولة بتستخرج كل اللي لقته لحد ما تخلّص.
+// الحد الوحيد مهلة الطلب في Cloud Run (أقصاها ساعة -- لازم --timeout=3600): بنقف قبلها بـ 5 دقايق،
+// واللي فضل (لو فضل) بيكمّل في الجولة اللي بعدها على طول.
+const AUTO_MAX_PER_RUN = Number(process.env.AUTO_MAX_PER_RUN || 0) || Infinity;
+const AUTO_BUDGET_MS = Math.max(60000, Number(process.env.AUTO_BUDGET_MS || 3300000));   // 55 دقيقة
+const AUTO_FLUSH_MS = 30000;    // كل 30 ثانية: اللي اتقرا يتضاف للتقارير على طول (مايستناش آخر الجولة)
+// كام شهادة بتتفتح في نفس الوقت في الجولة التلقائية (كانت 3 -> 120 شهادة بتاخد دقيقة ونص).
+// الافتراضي 12 (محتاج --cpu 2 --memory 2Gi). ممكن تتغير من المتغير AUTO_CONCURRENCY من غير رفع كود.
+const AUTO_CONCURRENCY = Math.max(1, Math.min(32, Number(process.env.AUTO_CONCURRENCY || 12)));
 const AUTO_MAX_ATTEMPTS = 3;
 let autoRunning = false;
 let gcpTok = { v: "", exp: 0 };
@@ -1435,7 +1439,7 @@ async function autoRunBody() {
     }
   }
   todo.sort((x, y) => (Date.parse(y.f.createdTime || y.f.modifiedTime || "") || 0) - (Date.parse(x.f.createdTime || x.f.modifiedTime || "") || 0));
-  const queue = todo.slice(0, AUTO_MAX_PER_RUN);
+  const queue = isFinite(AUTO_MAX_PER_RUN) ? todo.slice(0, AUTO_MAX_PER_RUN) : todo;
 
   let processed = 0, plates = 0, lessors = 0, fresh = 0, freshHidden = 0;
   let repAdd = {};     // الشركة -> لوحات جديدة للتقرير اليومي (من آخر إضافة)
@@ -1457,11 +1461,11 @@ async function autoRunBody() {
     }
     lastFlush = Date.now();
   }
-  const CHUNK = 9;
+  const CHUNK = AUTO_CONCURRENCY * 3;
   for (let i = 0; i < queue.length; i += CHUNK) {
     if (Date.now() - t0 > AUTO_BUDGET_MS) break;
     const chunk = queue.slice(i, i + CHUNK);
-    const outs = await mapWithConcurrency(chunk, CERT_RESOLVE_CONCURRENCY, async (it) => {
+    const outs = await mapWithConcurrency(chunk, AUTO_CONCURRENCY, async (it) => {
       if (it.pendingRep) return { plate: it.prev.p, lessor: { name: it.prev.l, cr: it.prev.c || null } };
       if (needsOpenName(it.f.name)) return resolveOnePlate(it.f.id, "both", serverHdr);
       // اسم الشركة متقري قبل كده واللوحة من الاسم -> مش محتاجين نفتح الملف
