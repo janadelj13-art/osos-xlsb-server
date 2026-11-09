@@ -1199,7 +1199,8 @@ function needsOpenName(name) { return /^\s*(repo|crn|arn)/i.test(String(name || 
 
 // ملف اسمه رقم لوحة ("ابح 1234.pdf" أو "ABC 1234.pdf") -> اللوحة بالعربي، وإلا ""
 function plateFromFileName(name) {
-  let n = String(name || "").replace(/\.pdf$/i, "").replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
+  // «د ص ط 5508 (1).pdf»: الـ (1) اللي بيضيفها الموبايل لما الملف يتنزل مرتين بنشيلها
+  let n = String(name || "").replace(/\.pdf$/i, "").replace(/\s*\(\d{1,3}\)\s*$/, "").replace(/[_\-]+/g, " ").replace(/\s+/g, " ").trim();
   n = englishPlateToArabic(n);
   const m = n.match(/^([\u0621-\u064A])\s?([\u0621-\u064A])\s?([\u0621-\u064A])\s?(\d{1,4})$/);
   return m ? (m[1] + m[2] + m[3] + " " + m[4]) : "";
