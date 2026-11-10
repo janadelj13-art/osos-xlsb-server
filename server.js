@@ -1088,7 +1088,7 @@ app.post("/api/push/post", async (req, res) => {
     const text = String(fv(post, "text") || "");
     const companies = fv(post, "companies") || [];
     const payload = report
-      ? { aps: { alert: { title: "📊 تقرير يومي جديد: " + companies.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" }, tab: "cert" }
+      ? { aps: { alert: { title: "📊 تقرير يومي جديد: " + companies.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" }, tab: "reports" }
       : { aps: { alert: { title: "📢 إشعار من الإدارة", body: masked ? "وصل إشعار جديد من الإدارة — افتح التطبيق لعرضه" : text.slice(0, 400) }, sound: "default" } };
 
     // المستلمين: الكل، أو الحسابات اللي الأدمن اختارها (+ الأدمن بيشوف كل الإشعارات)
@@ -1203,7 +1203,7 @@ async function createAutoReports(byCompany, opts) {
       docs = docs.filter((d) => fv(d, "status") !== "paused");
       push = await pushToDevices(docs.flatMap(tokensOfDoc), {
         aps: { alert: { title: "📊 نزلت شهادات جديدة في التقارير اليومية: " + cos.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" },
-        tab: "cert"
+        tab: "reports"   // الضغط على الإشعار بيفتح «التقارير اليومية» على طول
       });
     } catch (e) { push = { error: String((e && e.message) || e).slice(0, 150) }; }
   }
