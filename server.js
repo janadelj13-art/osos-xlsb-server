@@ -1160,16 +1160,51 @@ function reportCompanyOf(lessor) {
   return best || raw;
 }
 
+// اللوحات اللي موجودة فعلاً في التقارير اليومية (آخر 24 ساعة) -> مانعملش بيها تقرير ولا إشعار تاني
+async function recentReportPlateKeys() {
+  const have = new Set();
+  const since = Date.now() - AUTO_REPORT_MAX_AGE_MS;
+  const docs = await fsRunQuery({
+    from: [{ collectionId: "announcements" }],
+    where: { fieldFilter: { field: { fieldPath: "report" }, op: "EQUAL", value: { booleanValue: true } } }
+  });
+  for (const d of docs) {
+    const idN = Number(fv(d, "id"));
+    const t = isFinite(idN) && idN > 1e12 ? idN : (Date.parse(fv(d, "createdAt") || "") || 0);
+    if (t && t < since) continue;
+    String(fv(d, "text") || "").split(/\r?\n/).forEach((l) => { const k = plateKeyLoose(l.trim()); if (k) have.add(k); });
+  }
+  return have;
+}
+
 async function createAutoReports(byCompany, opts) {
   const doPush = !opts || opts.push !== false;   // في الجولة الطويلة: إشعار مع أول إضافة بس
-  const cos = Object.keys(byCompany);
-  if (!cos.length) return { reports: 0 };
+  const cosIn = Object.keys(byCompany);
+  if (!cosIn.length) return { reports: 0, handled: true };
+  // نشيل اللوحات اللي اتكتبت قبل كده (نسخة تانية من نفس الشهادة «(1).pdf» أو اترفعت تاني)
+  const have = await recentReportPlateKeys();
+  const fresh = {};   // الشركة -> اللوحات الجديدة بس
+  let dup = 0;
+  for (const co of cosIn) {
+    const seenHere = new Set();
+    for (const p of byCompany[co] || []) {
+      if (!p) continue;
+      const k = plateKeyLoose(p) || String(p).replace(/\s+/g, "");
+      if (seenHere.has(k)) continue;
+      seenHere.add(k);
+      if (have.has(k)) { dup++; continue; }
+      have.add(k);
+      (fresh[co] = fresh[co] || []).push(p);
+    }
+  }
+  const cos = Object.keys(fresh);
+  if (!cos.length) return { reports: 0, dup, handled: true };   // مفيش جديد -> لا تقرير ولا إشعار
   const base = Date.now();
   let made = 0;
+  const madeCos = [];
   for (let i = 0; i < cos.length; i++) {
     const co = cos[i];
-    const plates = Array.from(new Set(byCompany[co])).filter(Boolean);
-    if (!plates.length) continue;
+    const plates = fresh[co];
     const id = String(base + i);
     const fields = {
       text: { stringValue: plates.join("\n") },
@@ -1192,22 +1227,36 @@ async function createAutoReports(byCompany, opts) {
       headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
       body: JSON.stringify({ fields })
     });
-    if (r.ok) made++;
+    if (r.ok) { made++; madeCos.push(co); }
     else console.log("[auto-report] save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
   }
-  // إشعار واحد لكل المشتركين (ستارة الآيفون) بأسماء الشركات اللي نزلها تقرير
+  // إشعار واحد بالجديد بس: كام لوحة جديدة لكل شركة + أول اللوحات
   let push = null;
   if (made && doPush && pushReady()) {
     try {
+      const msg = reportPushText(madeCos.map((co) => ({ co, plates: fresh[co] })));
       let docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
       docs = docs.filter((d) => fv(d, "status") !== "paused");
       push = await pushToDevices(docs.flatMap(tokensOfDoc), {
-        aps: { alert: { title: "📊 نزلت شهادات جديدة في التقارير اليومية: " + cos.join("، "), body: "افتح شاشة الشهادات ← التقارير اليومية" }, sound: "default" },
+        aps: { alert: { title: msg.title, body: msg.body }, sound: "default" },
         tab: "reports"   // الضغط على الإشعار بيفتح «التقارير اليومية» على طول
       });
     } catch (e) { push = { error: String((e && e.message) || e).slice(0, 150) }; }
   }
-  return { reports: made, companies: cos.length, push };
+  return { reports: made, companies: cos.length, dup, handled: made === cos.length, push };
+}
+
+// نص الإشعار: «📊 جديد في التقارير اليومية: 5 لوحات» + «تمويل +3، إجارة +2» + أول اللوحات
+function reportPushText(groups) {
+  const total = groups.reduce((n, g) => n + g.plates.length, 0);
+  const per = groups.map((g) => g.co + ": " + g.plates.length).join("، ");
+  const all = groups.flatMap((g) => g.plates);
+  const show = all.slice(0, 6).join(" ، ");
+  const more = all.length > 6 ? " … و" + (all.length - 6) + " كمان" : "";
+  return {
+    title: "📊 جديد في التقارير اليومية: " + total + (total === 1 ? " لوحة" : total <= 10 ? " لوحات" : " لوحة"),
+    body: per + "\n" + show + more
+  };
 }
 
 function needsOpenName(name) { return /^\s*(repo|crn|arn)/i.test(String(name || "")); }
@@ -1453,8 +1502,8 @@ async function autoRunBody() {
     let rr = null;
     try { rr = await createAutoReports(add, { push: !pushedOnce }); } catch (e) { rr = { error: String((e && e.message) || e).slice(0, 200) }; }
     reportsOut.push(rr);
-    if (rr && rr.reports) {
-      pushedOnce = true;
+    if (rr && (rr.reports || rr.handled)) {
+      if (rr.reports) pushedOnce = true;
       const byDay = {};
       ids.forEach((x) => { (byDay[x.d] = byDay[x.d] || {})[x.id] = Object.assign({}, x.e, { r: 1 }); });
       for (const d of Object.keys(byDay)) { try { await fsSaveDay(d, byDay[d]); } catch (e) {} }
