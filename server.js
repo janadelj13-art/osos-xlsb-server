@@ -1177,8 +1177,7 @@ async function recentReportPlateKeys() {
   return have;
 }
 
-async function createAutoReports(byCompany, opts) {
-  const doPush = !opts || opts.push !== false;   // في الجولة الطويلة: إشعار مع أول إضافة بس
+async function createAutoReports(byCompany) {
   const cosIn = Object.keys(byCompany);
   if (!cosIn.length) return { reports: 0, handled: true };
   // نشيل اللوحات اللي اتكتبت قبل كده (نسخة تانية من نفس الشهادة «(1).pdf» أو اترفعت تاني)
@@ -1219,7 +1218,7 @@ async function createAutoReports(byCompany, opts) {
       audience: { stringValue: "all" },
       targets: { arrayValue: { values: [] } },
       targetNames: { arrayValue: { values: [] } },
-      pushedAt: { stringValue: new Date().toISOString() },
+      pushPending: { booleanValue: true },   // الإشعار بيطلع بعد ما السيرفر يخلّص كل الشهادات (pushPendingReports)
       createdAt: { timestampValue: new Date().toISOString() }
     };
     const r = await fetch(FS_DOCS + "/announcements/" + id + "?currentDocument.exists=false", {
@@ -1230,20 +1229,53 @@ async function createAutoReports(byCompany, opts) {
     if (r.ok) { made++; madeCos.push(co); }
     else console.log("[auto-report] save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
   }
-  // إشعار واحد بالجديد بس: كام لوحة جديدة لكل شركة + أول اللوحات
+  return { reports: made, companies: cos.length, dup, handled: made === cos.length };
+}
+
+// بعد ما السيرفر يخلّص كل الشهادات اللي عنده: إشعار واحد بكل اللي اتضاف من آخر إشعار
+// (التقارير اللي لسه pushPending=true)، وبعدها بتتعلّم إنها اتبلّغت. لو شغالين على 500 شهادة مايطلعش إشعار كل شوية.
+async function pushPendingReports() {
+  const docs = await fsRunQuery({
+    from: [{ collectionId: "announcements" }],
+    where: { fieldFilter: { field: { fieldPath: "pushPending" }, op: "EQUAL", value: { booleanValue: true } } }
+  });
+  if (!docs.length) return { pending: 0 };
+  const byCo = {}, seenK = new Set();
+  docs.sort((x, y) => String(fv(x, "id") || "").localeCompare(String(fv(y, "id") || ""), undefined, { numeric: true }));
+  for (const d of docs) {
+    const co = (fv(d, "companies") || [])[0] || "";
+    String(fv(d, "text") || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).forEach((pl) => {
+      const k = co + "|" + (plateKeyLoose(pl) || pl.replace(/\s+/g, ""));
+      if (seenK.has(k)) return;
+      seenK.add(k);
+      (byCo[co] = byCo[co] || []).push(pl);
+    });
+  }
   let push = null;
-  if (made && doPush && pushReady()) {
+  const groups = Object.keys(byCo).map((co) => ({ co, plates: byCo[co] })).filter((g) => g.plates.length);
+  if (groups.length && pushReady()) {
     try {
-      const msg = reportPushText(madeCos.map((co) => ({ co, plates: fresh[co] })));
-      let docs = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
-      docs = docs.filter((d) => fv(d, "status") !== "paused");
-      push = await pushToDevices(docs.flatMap(tokensOfDoc), {
+      const msg = reportPushText(groups);
+      let users = await fsRunQuery({ from: [{ collectionId: "users" }], select: { fields: [{ fieldPath: "pushTokens" }, { fieldPath: "status" }] } });
+      users = users.filter((d) => fv(d, "status") !== "paused");
+      push = await pushToDevices(users.flatMap(tokensOfDoc), {
         aps: { alert: { title: msg.title, body: msg.body }, sound: "default" },
         tab: "reports"   // الضغط على الإشعار بيفتح «التقارير اليومية» على طول
       });
     } catch (e) { push = { error: String((e && e.message) || e).slice(0, 150) }; }
   }
-  return { reports: made, companies: cos.length, dup, handled: made === cos.length, push };
+  // نعلّمهم «اتبلّغوا» (حتى لو الإشعار مااتبعتش، علشان التقارير تظهر في التطبيق ومانفضلش نحاول)
+  const now = new Date().toISOString();
+  for (const d of docs) {
+    try {
+      await fetch("https://firestore.googleapis.com/v1/" + d.name + "?updateMask.fieldPaths=pushPending&updateMask.fieldPaths=pushedAt&currentDocument.exists=true", {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: { pushPending: { booleanValue: false }, pushedAt: { stringValue: now } } })
+      });
+    } catch (e) {}
+  }
+  return { pending: docs.length, companies: groups.length, plates: groups.reduce((n, g) => n + g.plates.length, 0), push };
 }
 
 // نص الإشعار: «📊 جديد في التقارير اليومية: 5 لوحات» + «تمويل +3، إجارة +2» + أول اللوحات
@@ -1494,16 +1526,15 @@ async function autoRunBody() {
   let repAdd = {};     // الشركة -> لوحات جديدة للتقرير اليومي (من آخر إضافة)
   let repIds = [];     // الشهادات اللي في repAdd: [{ d, id, e }] -> بعد ما تتضاف بنعلّمها r=1
   const reportsOut = [];
-  let lastFlush = Date.now(), pushedOnce = false;
+  let lastFlush = Date.now();
   async function flushReports() {
     if (!Object.keys(repAdd).length) return;
     const add = repAdd, ids = repIds;
     repAdd = {}; repIds = [];
     let rr = null;
-    try { rr = await createAutoReports(add, { push: !pushedOnce }); } catch (e) { rr = { error: String((e && e.message) || e).slice(0, 200) }; }
+    try { rr = await createAutoReports(add); } catch (e) { rr = { error: String((e && e.message) || e).slice(0, 200) }; }
     reportsOut.push(rr);
     if (rr && (rr.reports || rr.handled)) {
-      if (rr.reports) pushedOnce = true;
       const byDay = {};
       ids.forEach((x) => { (byDay[x.d] = byDay[x.d] || {})[x.id] = Object.assign({}, x.e, { r: 1 }); });
       for (const d of Object.keys(byDay)) { try { await fsSaveDay(d, byDay[d]); } catch (e) {} }
@@ -1553,10 +1584,15 @@ async function autoRunBody() {
     if (Date.now() - lastFlush >= AUTO_FLUSH_MS) await flushReports();
   }
   await flushReports();
+  // خلّصنا كل الشهادات اللي كانت مستنية؟ -> دلوقتي بس إشعار التقارير اليومية (مرة واحدة بكل الجديد)
+  let repPush = null;
+  if (AUTO_REPORTS && processed >= todo.length) {
+    try { repPush = await pushPendingReports(); } catch (e) { repPush = { error: String((e && e.message) || e).slice(0, 200) }; }
+  }
   let push = null;
   try { push = await pushNewCertsToAdmins(freshHidden); } catch (e) { push = { error: String((e && e.message) || e).slice(0, 200) }; }
   const reports = reportsOut.length ? { flushes: reportsOut.length, reports: reportsOut.reduce((n, x) => n + ((x && x.reports) || 0), 0), last: reportsOut[reportsOut.length - 1] } : { reports: 0 };
-  const out = { listed: files.length, todo: todo.length, processed, left: Math.max(0, todo.length - processed), fresh, plates, lessors, push, reports, ms: Date.now() - t0 };
+  const out = { listed: files.length, todo: todo.length, processed, left: Math.max(0, todo.length - processed), fresh, plates, lessors, push, reports, repPush, ms: Date.now() - t0 };
   console.log("[auto-run] " + JSON.stringify(out));
   return out;
 }
