@@ -1336,6 +1336,8 @@ app.post("/api/reports/referral-hit", async (req, res) => {
     if (!me || fv(me, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
     const sent = Array.isArray(req.body && req.body.plates) ? req.body.plates.slice(0, 3000) : [];
     const keys = new Set(sent.map(plateKeyLoose).filter(Boolean));
+    // اللوحات اللي الأدمن رجّعها (restore-purged) ماتتمسحش تاني بالإحالة لحد ما مدتها تخلص
+    (await refExemptKeys()).forEach((k) => keys.delete(k));
     if (!keys.size) return res.json({ ok: true, removed: 0 });
 
     const docs = await fsRunQuery({
@@ -1382,6 +1384,126 @@ app.post("/api/reports/referral-hit", async (req, res) => {
       }).catch(() => {});
     }
     res.json({ ok: true, removed, reports: touched });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
+/* ============================================================
+   استرجاع اللوحات اللي اتشالت من التقارير بالإحالة/الفرز بالغلط: POST /api/reports/restore-purged {hours}
+   - الأدمن الرئيسي بس
+   - بيقرا reportRefPurgeLog آخر N ساعة (الافتراضي 12، أقصى 48) ويرجّع السطور في تقرير يومي جديد لكل شركة
+   - الشركة بتتعرف من بيانات الشهادة (certMetaDay)، واللي مالهاش بيانات بتنزل تحت «مسترجعة»
+   - مابيكررش لوحة موجودة في تقرير دلوقتي، ومن غير إشعار
+   - اللوحات المسترجعة بتتسجّل في reportRefExempt/current عشان الإحالة ماتمسحهاش تاني (48 ساعة)
+   ============================================================ */
+const REF_EXEMPT_MS = 48 * 3600 * 1000;
+async function refExemptKeys() {
+  try {
+    const d = await fsGetDoc("reportRefExempt/current");
+    if (!d) return new Set();
+    const until = Date.parse(fv(d, "until") || "") || 0;
+    if (until < Date.now()) return new Set();
+    return new Set((fv(d, "keys") || []).filter(Boolean));
+  } catch (e) { return new Set(); }
+}
+
+app.post("/api/reports/restore-purged", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me || fv(me, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
+    const hours = Math.max(1, Math.min(48, Number((req.body && req.body.hours) || 12) || 12));
+    const dry = !!(req.body && req.body.dry);
+    const since = Date.now() - hours * 3600000;
+
+    // 1) السطور اللي اتشالت
+    const logs = await fsRunQuery({
+      from: [{ collectionId: "reportRefPurgeLog" }],
+      where: { fieldFilter: { field: { fieldPath: "at" }, op: "GREATER_THAN_OR_EQUAL", value: { timestampValue: new Date(since).toISOString() } } }
+    });
+    const lines = new Map();   // key -> السطر زي ما كان
+    for (const d of logs) for (const l of (fv(d, "plates") || [])) {
+      const t = String(l || "").trim();
+      const k = plateKeyLoose(t);
+      if (k && !lines.has(k)) lines.set(k, t);
+    }
+    if (!lines.size) return res.json({ ok: true, logs: logs.length, plates: 0, made: 0, companies: [] });
+
+    // 2) اللي موجود في تقرير دلوقتي -> مانكررهوش
+    const have = new Set();
+    const rdocs = await fsRunQuery({
+      from: [{ collectionId: "announcements" }],
+      where: { fieldFilter: { field: { fieldPath: "report" }, op: "EQUAL", value: { booleanValue: true } } }
+    });
+    for (const d of rdocs) String(fv(d, "text") || "").split(/\r?\n/).forEach((l) => { const k = plateKeyLoose(l.trim()); if (k) have.add(k); });
+    let skippedHave = 0;
+    for (const k of Array.from(lines.keys())) if (have.has(k)) { lines.delete(k); skippedHave++; }
+
+    // 3) الشركة من بيانات الشهادات (آخر 4 أيام)
+    const coOf = new Map();
+    try {
+      const lr = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/recent?hours=96&limit=3000", { headers: { "X-Server-Key": SERVER_KEY } });
+      const ld = await lr.json().catch(() => null);
+      const files = (ld && Array.isArray(ld.files)) ? ld.files.filter((f) => f && f.id) : [];
+      const days = {};
+      for (const f of files) { const d = dayOf(f); (days[d] = days[d] || []).push(f); }
+      for (const d of Object.keys(days)) {
+        const st = await fsGetDay(d);
+        for (const f of days[d]) {
+          const e = st[f.id];
+          if (!e || !e.p || !e.l) continue;
+          const k = plateKeyLoose(e.p);
+          if (k && lines.has(k) && !coOf.has(k)) { const co = reportCompanyOf(e.l); if (co) coOf.set(k, co); }
+        }
+      }
+    } catch (e) { console.log("[restore-purged] meta " + String((e && e.message) || e).slice(0, 120)); }
+
+    const by = {};
+    for (const [k, t] of lines) { const co = coOf.get(k) || "مسترجعة"; (by[co] = by[co] || []).push(t); }
+    const summary = Object.keys(by).map((co) => ({ company: co, plates: by[co].length }));
+    if (dry) return res.json({ ok: true, dry: true, logs: logs.length, plates: lines.size, skippedHave, companies: summary });
+
+    // 4) تقرير يومي جديد لكل شركة (وقته دلوقتي -> يفضل 24 ساعة)، من غير إشعار
+    let made = 0;
+    const base = Date.now();
+    const cos = Object.keys(by);
+    for (let i = 0; i < cos.length; i++) {
+      const id = String(base + i);
+      const fields = {
+        text: { stringValue: by[cos[i]].join("\n") },
+        id: { stringValue: id },
+        showClose: { booleanValue: true }, showSort: { booleanValue: true }, masked: { booleanValue: false }, showNote: { booleanValue: true },
+        report: { booleanValue: true }, auto: { booleanValue: true }, restored: { booleanValue: true },
+        companies: { arrayValue: { values: [{ stringValue: cos[i] }] } },
+        audience: { stringValue: "all" },
+        targets: { arrayValue: { values: [] } }, targetNames: { arrayValue: { values: [] } },
+        createdAt: { timestampValue: new Date().toISOString() }
+      };
+      const r = await fetch(FS_DOCS + "/announcements/" + id + "?currentDocument.exists=false", {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+        body: JSON.stringify({ fields })
+      });
+      if (r.ok) made++;
+      else console.log("[restore-purged] save HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+    }
+
+    // 5) الإحالة ماتمسحهمش تاني لمدة 48 ساعة
+    const ex = await refExemptKeys();
+    for (const k of lines.keys()) ex.add(k);
+    await fetch(FS_DOCS + "/reportRefExempt/current", {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: {
+        keys: { arrayValue: { values: Array.from(ex).slice(-5000).map((x) => ({ stringValue: x })) } },
+        until: { timestampValue: new Date(Date.now() + REF_EXEMPT_MS).toISOString() },
+        by: { stringValue: uid }
+      } })
+    }).catch(() => {});
+    console.log("[restore-purged] " + JSON.stringify({ hours, logs: logs.length, made, summary, skippedHave }));
+    res.json({ ok: true, logs: logs.length, plates: lines.size, made, skippedHave, companies: summary, keys: Array.from(lines.keys()) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
   }
