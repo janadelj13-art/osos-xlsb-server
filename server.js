@@ -1827,7 +1827,7 @@ app.post("/api/vin/read", async (req, res) => {
    POST /api/plates/read { image, mime }  -- نفس شروط /api/vin/read (مشترك شغال، حد في الساعة)
    بيرجّع كل اللوحات اللي في الصورة بالترتيب: [{ ar:"رمع", digits:"8929", latin:"A B S"|"" }]
    الصورة مش بتتحفظ ولا بتتكتب في اللوج. */
-const PLATE_MODELS = String(process.env.PLATE_MODELS || "claude-sonnet-5-5,claude-opus-5-5").split(",").map((x) => x.trim()).filter(Boolean);
+const PLATE_MODELS = String(process.env.PLATE_MODELS || "claude-opus-5-5,claude-sonnet-5-5").split(",").map((x) => x.trim()).filter(Boolean);
 const PL_EN_AR = { A: "ا", B: "ب", J: "ح", D: "د", R: "ر", S: "س", X: "ص", T: "ط", E: "ع", G: "ق", K: "ك", L: "ل", Z: "م", N: "ن", H: "ه", U: "و", V: "ي" };
 const PL_AR_OK = new Set(Object.values(PL_EN_AR));
 function plNormAr(t) {
@@ -1851,6 +1851,8 @@ async function visionReadPlates(model, b64, mime) {
           "The image contains Saudi vehicle license plate numbers (for example a table/spreadsheet column, a registration form, or a screenshot). " +
           "List EVERY plate number in the image, in order from top to bottom, including repeated ones. Do not skip rows. " +
           "A plate has 3 letters and 1 to 4 digits. Letters are written either in Arabic (e.g. \"ر م ع 8929\") or in English (e.g. \"7228 ABS\"). " +
+          "Saudi plate Arabic letters are ONLY these 17: ا ب ح د ر س ص ط ع ق ك ل م ن ه و ى -- look closely at each letter, they are small and spaced; " +
+          "do not confuse ه with م, ح with ج, ى with ي/ب, ر with د/و, ص with ض, ع with غ, ط with ظ. " +
           "Copy the digits exactly. For Arabic letters give them in normal reading order (right to left as written, first letter = rightmost). " +
           "For English letters give them left to right exactly as written. Ignore other numbers (contract numbers, phone numbers, years, dates, chassis numbers). " +
           "If a character is unreadable put ? in its place. " +
@@ -1872,7 +1874,7 @@ async function visionReadPlates(model, b64, mime) {
     if (!digits || digits.length > 4) continue;
     const en = String((p && p.en) || "").toUpperCase().replace(/[^A-Z?]/g, "");
     let ar = plNormAr(p && p.ar), latin = "";
-    if (!ar && en.length === 3) {
+    if (ar.length !== 3 && en.length === 3) {                                       // العربي ناقص والإنجليزي كامل -> ناخد الإنجليزي
       ar = en.split("").reverse().map((c) => PL_EN_AR[c] || "؟").join("");        // الإنجليزي عكس ترتيب العربي
       latin = en.split("").join(" ");
     }
@@ -1900,15 +1902,33 @@ app.post("/api/plates/read", async (req, res) => {
     const mime = /^image\/(jpeg|png|webp)$/.test(String(req.body && req.body.mime)) ? req.body.mime : "image/jpeg";
     if (b64.length < 1000 || b64.length > 7_500_000 || !/^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0, 2000))) return res.status(400).json({ ok: false, error: "image" });
     const t0 = Date.now();
-    let plates = [], model = "", lastErr = null;
-    for (const m of PLATE_MODELS) {
-      try { plates = await visionReadPlates(m, b64, mime); model = m; }
-      catch (e) { lastErr = e; console.log("⚠️ plates " + m + ": " + String((e && e.message) || e).slice(0, 160)); continue; }
-      if (plates.length) break;                                                     // لقى لوحات -> خلاص
+    // قرايتين مستقلتين في نفس الوقت (موديلين). الأساسية هي الأولى (الأقوى)، والتانية للمراجعة:
+    // أي لوحة الحروف بتاعتها مختلفة بين القرايتين بتتعلّم «راجعها» عشان الظابط يتأكد منها بعينه.
+    const okN = (arr) => arr.filter((p) => p.ok).length;
+    const runs = await Promise.all(PLATE_MODELS.slice(0, 2).map((m) => visionReadPlates(m, b64, mime).then((r) => ({ m, r }), (e) => {
+      console.log("⚠️ plates " + m + ": " + String((e && e.message) || e).slice(0, 160)); return { m, r: null, e };
+    })));
+    const good = runs.filter((x) => x.r);
+    if (!good.length) throw (runs[0] && runs[0].e) || new Error("no model");
+    // الأساسية: الأولى، إلا لو التانية فيها لوحات كاملة أكتر
+    let main = good[0];
+    if (good[1] && okN(good[1].r) > okN(main.r)) main = good[1];
+    const other = good.find((x) => x !== main);
+    const plates = main.r;
+    const model = main.m;
+    let diff = 0;
+    if (other) {
+      // بنقارن اللوحات اللي ليها نفس الأرقام بالترتيب
+      const pool = other.r.map((p) => ({ p, used: false }));
+      for (const p of plates) {
+        const q = pool.find((x) => !x.used && x.p.digits === p.digits);
+        if (!q) { p.check = true; diff++; continue; }
+        q.used = true;
+        if (q.p.ar !== p.ar) { p.check = true; p.alt = q.p.ar; diff++; }
+      }
     }
-    if (!model && lastErr) throw lastErr;
     // من غير اللوحات نفسها في اللوج -- بس العدد والوقت
-    console.log("🔎 plates [" + uid.slice(0, 6) + "] " + model + ": " + plates.length + " لوحة (" + plates.filter((p) => !p.ok).length + " مش كاملة) في " + (Date.now() - t0) + "ms");
+    console.log("🔎 plates [" + uid.slice(0, 6) + "] " + model + ": " + plates.length + " لوحة (" + plates.filter((p) => !p.ok).length + " مش كاملة، " + diff + " مختلفة بين القرايتين) في " + (Date.now() - t0) + "ms");
     res.json({ ok: true, plates });
   } catch (e) {
     console.log("⚠️ plates: " + String((e && e.message) || e).slice(0, 200));
