@@ -1823,6 +1823,99 @@ app.post("/api/vin/read", async (req, res) => {
   }
 });
 
+/* ---------- قراية كل اللوحات من صورة (جدول / استمارة / صورة شاشة) ----------
+   POST /api/plates/read { image, mime }  -- نفس شروط /api/vin/read (مشترك شغال، حد في الساعة)
+   بيرجّع كل اللوحات اللي في الصورة بالترتيب: [{ ar:"رمع", digits:"8929", latin:"A B S"|"" }]
+   الصورة مش بتتحفظ ولا بتتكتب في اللوج. */
+const PLATE_MODELS = String(process.env.PLATE_MODELS || "claude-sonnet-5-5,claude-opus-5-5").split(",").map((x) => x.trim()).filter(Boolean);
+const PL_EN_AR = { A: "ا", B: "ب", J: "ح", D: "د", R: "ر", S: "س", X: "ص", T: "ط", E: "ع", G: "ق", K: "ك", L: "ل", Z: "م", N: "ن", H: "ه", U: "و", V: "ي" };
+const PL_AR_OK = new Set(Object.values(PL_EN_AR));
+function plNormAr(t) {
+  return String(t || "").replace(/[أإآ]/g, "ا").replace(/ة/g, "ه").replace(/ى/g, "ي").replace(/[^ء-ي]/g, "");
+}
+function plDigits(t) {
+  return String(t || "").replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x660)).replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x6F0)).replace(/\D/g, "");
+}
+const plNoThink = {};
+async function visionReadPlates(model, b64, mime) {
+  const think = !plNoThink[model];
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": VISION_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify(Object.assign({
+      model,
+      max_tokens: 8000,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mime, data: b64 } },
+        { type: "text", text:
+          "The image contains Saudi vehicle license plate numbers (for example a table/spreadsheet column, a registration form, or a screenshot). " +
+          "List EVERY plate number in the image, in order from top to bottom, including repeated ones. Do not skip rows. " +
+          "A plate has 3 letters and 1 to 4 digits. Letters are written either in Arabic (e.g. \"ر م ع 8929\") or in English (e.g. \"7228 ABS\"). " +
+          "Copy the digits exactly. For Arabic letters give them in normal reading order (right to left as written, first letter = rightmost). " +
+          "For English letters give them left to right exactly as written. Ignore other numbers (contract numbers, phone numbers, years, dates, chassis numbers). " +
+          "If a character is unreadable put ? in its place. " +
+          "Reply with JSON only, no other text: {\"plates\":[{\"ar\":\"رمع\",\"en\":\"\",\"digits\":\"8929\"},{\"ar\":\"\",\"en\":\"ABS\",\"digits\":\"7228\"}]}  -- or {\"plates\":[]} if there are none." }
+      ] }]
+    }, think ? { thinking: { type: "disabled" } } : {}))
+  });
+  const txt = await r.text();
+  if (!r.ok && r.status === 400 && think && /thinking/i.test(txt)) { plNoThink[model] = true; return visionReadPlates(model, b64, mime); }
+  if (!r.ok) throw new Error("vision HTTP " + r.status + " " + txt.slice(0, 160));
+  let d = null; try { d = JSON.parse(txt); } catch (e) {}
+  const out = String(((d && d.content) || []).map((c) => c.text || "").join(" "));
+  const m = /\{[\s\S]*\}/.exec(out);
+  let j = null; try { j = m ? JSON.parse(m[0]) : null; } catch (e) {}
+  if (!j || !Array.isArray(j.plates)) console.log("🔎 plates رد مش مفهوم (" + model + ", " + ((d && d.stop_reason) || "") + ")");
+  const res = [];
+  for (const p of (j && Array.isArray(j.plates)) ? j.plates : []) {
+    const digits = plDigits(p && p.digits);
+    if (!digits || digits.length > 4) continue;
+    const en = String((p && p.en) || "").toUpperCase().replace(/[^A-Z?]/g, "");
+    let ar = plNormAr(p && p.ar), latin = "";
+    if (!ar && en.length === 3) {
+      ar = en.split("").reverse().map((c) => PL_EN_AR[c] || "؟").join("");        // الإنجليزي عكس ترتيب العربي
+      latin = en.split("").join(" ");
+    }
+    if (!ar) continue;                                                              // أرقام من غير حروف = مش لوحة
+    const ok = ar.length === 3 && ar.split("").every((c) => PL_AR_OK.has(c));
+    res.push({ ar, digits, latin, ok });
+  }
+  return res;
+}
+app.post("/api/plates/read", async (req, res) => {
+  try {
+    if (!VISION_API_KEY) return res.status(503).json({ ok: false, error: "off" });
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me) return res.status(403).json({ ok: false, error: "user" });
+    const isAdmin = fv(me, "isAdmin") === true;
+    const exp = Date.parse(String(fv(me, "expiresAt") || ""));
+    if (!isAdmin && !isNaN(exp) && exp < Date.now()) return res.status(403).json({ ok: false, error: "expired" });
+    const now = Date.now();
+    const used = (vinUse.get(uid) || []).filter((t) => now - t < 3600000);       // نفس عداد قارئ الهيكل
+    if (!isAdmin && used.length >= VIN_PER_HOUR) return res.status(429).json({ ok: false, error: "limit" });
+    used.push(now); vinUse.set(uid, used);
+    const b64 = String((req.body && req.body.image) || "").replace(/^data:[^,]*,/, "");
+    const mime = /^image\/(jpeg|png|webp)$/.test(String(req.body && req.body.mime)) ? req.body.mime : "image/jpeg";
+    if (b64.length < 1000 || b64.length > 7_500_000 || !/^[A-Za-z0-9+/=\s]+$/.test(b64.slice(0, 2000))) return res.status(400).json({ ok: false, error: "image" });
+    const t0 = Date.now();
+    let plates = [], model = "", lastErr = null;
+    for (const m of PLATE_MODELS) {
+      try { plates = await visionReadPlates(m, b64, mime); model = m; }
+      catch (e) { lastErr = e; console.log("⚠️ plates " + m + ": " + String((e && e.message) || e).slice(0, 160)); continue; }
+      if (plates.length) break;                                                     // لقى لوحات -> خلاص
+    }
+    if (!model && lastErr) throw lastErr;
+    // من غير اللوحات نفسها في اللوج -- بس العدد والوقت
+    console.log("🔎 plates [" + uid.slice(0, 6) + "] " + model + ": " + plates.length + " لوحة (" + plates.filter((p) => !p.ok).length + " مش كاملة) في " + (Date.now() - t0) + "ms");
+    res.json({ ok: true, plates });
+  } catch (e) {
+    console.log("⚠️ plates: " + String((e && e.message) || e).slice(0, 200));
+    res.status(502).json({ ok: false, error: "read" });
+  }
+});
+
 // تجربة إشعار الآيفون: POST /api/push/test بنفس المفتاح السري (SERVER_KEY)
 app.post("/api/push/test", async (req, res) => {
   if (!SERVER_KEY || !keyEq(req.headers["x-server-key"] || "", SERVER_KEY)) return res.status(403).json({ ok: false, error: "forbidden" });
