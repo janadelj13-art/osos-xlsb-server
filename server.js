@@ -29,7 +29,9 @@ const app = express();
 
 // تحديد مين مسموح له يستخدم السيرفر (حط دومين موقعك هنا بدل * لو حابب تقفلها أكتر)
 app.use(cors({ origin: "*" }));
-app.use("/api/vin/read", express.json({ limit: "8mb" })); // صورة الشاصي (base64) أكبر من 1 ميجا أحيانًا
+app.use("/api/vin/read", express.json({ limit: "8mb" }));     // صورة الشاصي (base64) أكبر من 1 ميجا أحيانًا
+app.use("/api/plates/read", express.json({ limit: "8mb" }));  // صورة جدول اللوحات
+app.use("/api/pull/send", express.json({ limit: "12mb" }));   // سحب مباشر: 5 صور
 app.use(express.json({ limit: "1mb" })); // لازمة عشان endpoint استخراج أرقام اللوحات (بياخد JSON مش ملف)
 
 // نخزن الملف في الذاكرة مباشرة، مش على القرص أبدًا.
@@ -1933,6 +1935,103 @@ app.post("/api/plates/read", async (req, res) => {
   } catch (e) {
     console.log("⚠️ plates: " + String((e && e.message) || e).slice(0, 200));
     res.status(502).json({ ok: false, error: "read" });
+  }
+});
+
+/* ---------- سحب مباشر: 5 صور للعربية -> واتساب (رقم سري) ----------
+   POST /api/pull/send { plate, gps, images:[{view, b64}] x5 }
+   الرقم اللي بيستلم في Cloud Run env بس (WA_PULL_TO) — مش في التطبيق ولا بيرجع لأي حد، ولا بيتكتب في اللوج.
+   الإرسال من واتساب الرسمي (WhatsApp Cloud API) برسالة قالب فيها صورة:
+     WA_TOKEN        توكن دائم (System User) — سري
+     WA_PHONE_ID     Phone number ID بتاع رقم البيزنس
+     WA_PULL_TO      الرقم اللي بيستلم (دولي من غير + زي 9665xxxxxxxx)
+     WA_PULL_TEMPLATE اسم القالب (افتراضي osos_pull_photo) — Header: Image، Body فيه 5 متغيرات:
+                      اللوحة / الصورة / الظابط / الوقت / الموقع
+     WA_PULL_LANG    لغة القالب (افتراضي ar)
+   كل صورة بتتبعت رسالة لوحدها. الصور مش بتتحفظ على السيرفر. */
+const WA_GRAPH = "https://graph.facebook.com/v21.0";
+const PULL_VIEWS = ["الأمام", "اليسار", "اليمين", "الخلف", "على السطحة"];
+const pullUse = new Map();
+function waParam(t, max) {
+  // واتساب بيرفض المتغير لو فيه سطر جديد أو tab أو أكتر من 4 مسافات ورا بعض، أو لو فاضي
+  const v = String(t == null ? "" : t).replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim().slice(0, max || 200);
+  return v || "-";
+}
+async function waUploadImage(buf) {
+  const fd = new FormData();
+  fd.append("messaging_product", "whatsapp");
+  fd.append("type", "image/jpeg");
+  fd.append("file", new Blob([buf], { type: "image/jpeg" }), "pull.jpg");
+  const r = await fetch(WA_GRAPH + "/" + process.env.WA_PHONE_ID + "/media", { method: "POST", headers: { Authorization: "Bearer " + process.env.WA_TOKEN }, body: fd });
+  const d = await r.json().catch(() => null);
+  if (!r.ok || !d || !d.id) throw new Error("media HTTP " + r.status + " " + JSON.stringify((d && d.error && d.error.message) || d).slice(0, 160));
+  return d.id;
+}
+async function waSendPullPhoto(mediaId, params) {
+  const r = await fetch(WA_GRAPH + "/" + process.env.WA_PHONE_ID + "/messages", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + process.env.WA_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to: String(process.env.WA_PULL_TO || "").replace(/\D/g, ""),
+      type: "template",
+      template: {
+        name: process.env.WA_PULL_TEMPLATE || "osos_pull_photo",
+        language: { code: process.env.WA_PULL_LANG || "ar" },
+        components: [
+          { type: "header", parameters: [{ type: "image", image: { id: mediaId } }] },
+          { type: "body", parameters: params.map((t) => ({ type: "text", text: waParam(t) })) }
+        ]
+      }
+    })
+  });
+  const d = await r.json().catch(() => null);
+  if (!r.ok) throw new Error("send HTTP " + r.status + " " + JSON.stringify((d && d.error && d.error.message) || d).slice(0, 160));
+}
+app.post("/api/pull/send", async (req, res) => {
+  try {
+    if (!process.env.WA_TOKEN || !process.env.WA_PHONE_ID || !process.env.WA_PULL_TO) return res.status(503).json({ ok: false, error: "off" });
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me) return res.status(403).json({ ok: false, error: "user" });
+    const isAdmin = fv(me, "isAdmin") === true;
+    if (!isAdmin && fv(me, "paused") === true) return res.status(403).json({ ok: false, error: "paused" });
+    const exp = Date.parse(String(fv(me, "expiresAt") || ""));
+    if (!isAdmin && !isNaN(exp) && exp < Date.now()) return res.status(403).json({ ok: false, error: "expired" });
+    const now = Date.now();
+    const used = (pullUse.get(uid) || []).filter((t) => now - t < 3600000);
+    if (!isAdmin && used.length >= 20) return res.status(429).json({ ok: false, error: "limit" });
+    const b = req.body || {};
+    const plate = waParam(b.plate, 20);
+    const imgs = Array.isArray(b.images) ? b.images : [];
+    if (plate === "-" || imgs.length !== PULL_VIEWS.length) return res.status(400).json({ ok: false, error: "bad" });
+    const bufs = imgs.map((x) => Buffer.from(String((x && x.b64) || "").replace(/^data:[^,]*,/, ""), "base64"));
+    if (bufs.some((x) => x.length < 2000 || x.length > 2_500_000 || x[0] !== 0xFF || x[1] !== 0xD8)) return res.status(400).json({ ok: false, error: "image" });
+    used.push(now); pullUse.set(uid, used);
+    const officer = String(fv(me, "name") || fv(me, "displayName") || fv(me, "email") || uid).split("@")[0];
+    const when = new Date().toLocaleString("ar-EG", { timeZone: "Asia/Riyadh", hour12: true, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const g = String(b.gps || "").match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
+    const loc = g ? "https://maps.google.com/?q=" + g[1] + "," + g[2] : "-";
+    const t0 = Date.now();
+    // نرفع الصور الخمسة مع بعض، وبعدين نبعتهم بالترتيب
+    const ids = await Promise.all(bufs.map(waUploadImage));
+    for (let i = 0; i < ids.length; i++) {
+      await waSendPullPhoto(ids[i], [plate, PULL_VIEWS[i] + " (" + (i + 1) + "/" + ids.length + ")", officer, when, loc]);
+    }
+    // سجل من غير الصور ومن غير الرقم
+    try {
+      await fetch(FS_DOCS + "/pullLog/" + now + "-" + uid.slice(0, 8), {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: { uid: { stringValue: uid }, plate: { stringValue: plate }, gps: { stringValue: g ? g[1] + "," + g[2] : "" }, at: { timestampValue: new Date().toISOString() } } })
+      });
+    } catch (e) {}
+    console.log("🚚 pull [" + uid.slice(0, 6) + "] اتبعت 5 صور في " + (Date.now() - t0) + "ms");
+    res.json({ ok: true });
+  } catch (e) {
+    console.log("⚠️ pull: " + String((e && e.message) || e).slice(0, 220));
+    res.status(502).json({ ok: false, error: "send" });
   }
 });
 
