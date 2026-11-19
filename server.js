@@ -1988,7 +1988,18 @@ async function waSendPullPhoto(mediaId, params) {
   const d = await r.json().catch(() => null);
   if (!r.ok) throw new Error("send HTTP " + r.status + " " + JSON.stringify((d && d.error && d.error.message) || d).slice(0, 160));
 }
+async function pullLogWrite(id, uid, plate, gps, status) {
+  try {
+    await fetch(FS_DOCS + "/pullLog/" + id, {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { uid: { stringValue: uid }, plate: { stringValue: plate }, gps: { stringValue: gps }, status: { stringValue: status }, at: { timestampValue: new Date().toISOString() } } })
+    });
+  } catch (e) {}
+}
+
 app.post("/api/pull/send", async (req, res) => {
+  let logId = "", logUid = "", logPlate = "", logGps = "";
   try {
     if (!process.env.WA_TOKEN || !process.env.WA_PHONE_ID || !process.env.WA_PULL_TO) return res.status(503).json({ ok: false, error: "off" });
     const uid = await uidFromReq(req);
@@ -2014,24 +2025,45 @@ app.post("/api/pull/send", async (req, res) => {
     const g = String(b.gps || "").match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
     const loc = g ? "https://maps.google.com/?q=" + g[1] + "," + g[2] : "-";
     const t0 = Date.now();
+    logId = now + "-" + uid.slice(0, 8); logUid = uid; logPlate = plate; logGps = g ? g[1] + "," + g[2] : "";
     // نرفع الصور الخمسة مع بعض، وبعدين نبعتهم بالترتيب
     const ids = await Promise.all(bufs.map(waUploadImage));
     for (let i = 0; i < ids.length; i++) {
       await waSendPullPhoto(ids[i], [plate, PULL_VIEWS[i] + " (" + (i + 1) + "/" + ids.length + ")", officer, when, loc]);
     }
     // سجل من غير الصور ومن غير الرقم
-    try {
-      await fetch(FS_DOCS + "/pullLog/" + now + "-" + uid.slice(0, 8), {
-        method: "PATCH",
-        headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
-        body: JSON.stringify({ fields: { uid: { stringValue: uid }, plate: { stringValue: plate }, gps: { stringValue: g ? g[1] + "," + g[2] : "" }, at: { timestampValue: new Date().toISOString() } } })
-      });
-    } catch (e) {}
+    await pullLogWrite(logId, uid, plate, logGps, "sent");
     console.log("🚚 pull [" + uid.slice(0, 6) + "] اتبعت 5 صور في " + (Date.now() - t0) + "ms");
     res.json({ ok: true });
   } catch (e) {
     console.log("⚠️ pull: " + String((e && e.message) || e).slice(0, 220));
+    if (logId) await pullLogWrite(logId, logUid, logPlate, logGps, "fail");
     res.status(502).json({ ok: false, error: "send" });
+  }
+});
+
+/* GET /api/pull/mine — طلبات السحب المباشر بتاعة الحساب ده بس (آخر 50)
+   result/note: لو اتحطت نتيجة للطلب (موافق/مرفوض + ملاحظة) بتظهر، غير كده بتفضل فاضية */
+app.get("/api/pull/mine", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const docs = await fsRunQuery({
+      from: [{ collectionId: "pullLog" }],
+      where: { fieldFilter: { field: { fieldPath: "uid" }, op: "EQUAL", value: { stringValue: uid } } },
+      limit: 300
+    });
+    const items = docs.map((d) => ({
+      plate: String(fv(d, "plate") || ""),
+      at: String(fv(d, "at") || ""),
+      status: String(fv(d, "status") || "sent"),
+      result: String(fv(d, "result") || ""),
+      note: String(fv(d, "note") || "")
+    })).sort((a, b) => Date.parse(b.at || 0) - Date.parse(a.at || 0)).slice(0, 50);
+    res.json({ ok: true, items });
+  } catch (e) {
+    console.log("⚠️ pull/mine: " + String((e && e.message) || e).slice(0, 200));
+    res.status(500).json({ ok: false, error: "read" });
   }
 });
 
