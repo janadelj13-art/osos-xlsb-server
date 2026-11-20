@@ -32,6 +32,7 @@ app.use(cors({ origin: "*" }));
 app.use("/api/vin/read", express.json({ limit: "8mb" }));     // صورة الشاصي (base64) أكبر من 1 ميجا أحيانًا
 app.use("/api/plates/read", express.json({ limit: "8mb" }));  // صورة جدول اللوحات
 app.use("/api/pull/send", express.json({ limit: "12mb" }));   // سحب مباشر: 5 صور
+app.use("/api/tafweed/upload", express.json({ limit: "14mb" })); // ملف التفويض PDF (base64)
 app.use(express.json({ limit: "1mb" })); // لازمة عشان endpoint استخراج أرقام اللوحات (بياخد JSON مش ملف)
 
 // نخزن الملف في الذاكرة مباشرة، مش على القرص أبدًا.
@@ -2039,6 +2040,87 @@ app.post("/api/pull/send", async (req, res) => {
     console.log("⚠️ pull: " + String((e && e.message) || e).slice(0, 220));
     if (logId) await pullLogWrite(logId, logUid, logPlate, logGps, "fail");
     res.status(502).json({ ok: false, error: "send" });
+  }
+});
+
+/* ===== ملف التفويض (PDF) =====
+   POST /api/tafweed/upload  { uid, name, pdf(base64) }   — الأدمن الرئيسي بس
+     بيتخزن في Firestore أجزاء (tafweedFiles/{fid} + tafweedFiles/{fid}_p0..)،
+     وبيتكتب على حساب المشترك users/{uid}.tafweedFiles.{fid} = { name, at, k } وبيوصله إشعار «تم إصدار التفويض».
+   GET /api/tafweed/file?id=&k=[&dl=1]  — اللينك فيه مفتاح عشوائي (k) مايعرفوش غير صاحب الحساب والأدمن */
+const TW_PART = 700000;   // حروف base64 لكل جزء (أقل من حد المستند 1 ميجا)
+async function fsPatchDoc(path, fields, mask) {
+  const q = mask ? "?" + mask.map((f) => "updateMask.fieldPaths=" + encodeURIComponent(f)).join("&") : "";
+  const r = await fetch(FS_DOCS + "/" + path + q, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+    body: JSON.stringify({ fields })
+  });
+  if (!r.ok) throw new Error("firestore patch HTTP " + r.status + " " + (await r.text()).slice(0, 150));
+}
+app.post("/api/tafweed/upload", async (req, res) => {
+  try {
+    const me = await uidFromReq(req);
+    if (!me) return res.status(401).json({ ok: false, error: "auth" });
+    const meDoc = await fsGetDoc("users/" + encodeURIComponent(me));
+    if (!meDoc || fv(meDoc, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
+    const b = req.body || {};
+    const uid = String(b.uid || "");
+    if (!/^[A-Za-z0-9_-]{6,128}$/.test(uid)) return res.status(400).json({ ok: false, error: "uid" });
+    const pdf = String(b.pdf || "").replace(/^data:[^,]*,/, "").replace(/\s+/g, "");
+    const buf = Buffer.from(pdf, "base64");
+    if (buf.length < 100 || buf.slice(0, 5).toString("latin1") !== "%PDF-") return res.status(400).json({ ok: false, error: "not pdf" });
+    if (buf.length > 9 * 1024 * 1024) return res.status(413).json({ ok: false, error: "too big" });
+    const target = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!target) return res.status(404).json({ ok: false, error: "user" });
+    const name = String(b.name || "تفويض.pdf").replace(/[\\/:*?"<>|\r\n]+/g, " ").trim().slice(0, 120) || "تفويض.pdf";
+    const fid = "f" + crypto.randomBytes(8).toString("hex");
+    const k = crypto.randomBytes(18).toString("hex");
+    const b64 = buf.toString("base64");
+    const parts = Math.ceil(b64.length / TW_PART);
+    for (let i = 0; i < parts; i++) {
+      await fsPatchDoc("tafweedFiles/" + fid + "_p" + i, { b: { stringValue: b64.slice(i * TW_PART, (i + 1) * TW_PART) } });
+    }
+    const at = new Date().toISOString();
+    await fsPatchDoc("tafweedFiles/" + fid, {
+      uid: { stringValue: uid }, name: { stringValue: name }, k: { stringValue: k },
+      size: { integerValue: String(buf.length) }, parts: { integerValue: String(parts) }, at: { stringValue: at }, by: { stringValue: me }
+    });
+    await fsPatchDoc("users/" + encodeURIComponent(uid), {
+      tafweedFiles: { mapValue: { fields: { [fid]: { mapValue: { fields: { name: { stringValue: name }, at: { stringValue: at }, k: { stringValue: k } } } } } } }
+    }, ["tafweedFiles." + fid]);
+    let push = null;
+    try {
+      push = await pushToDevices(tokensOfDoc(target), { aps: { alert: { title: "📝 تم إصدار التفويض", body: "افتح «طلب تفويض» من القائمة لتنزيل الملف" }, sound: "default" } });
+    } catch (e) { push = { error: String((e && e.message) || e).slice(0, 100) }; }
+    res.json({ ok: true, id: fid, push });
+  } catch (e) {
+    console.log("⚠️ tafweed/upload: " + String((e && e.message) || e).slice(0, 200));
+    res.status(500).json({ ok: false, error: "upload" });
+  }
+});
+app.get("/api/tafweed/file", async (req, res) => {
+  try {
+    const id = String(req.query.id || ""), k = String(req.query.k || "");
+    if (!/^f[0-9a-f]{16}$/.test(id) || !/^[0-9a-f]{36}$/.test(k)) return res.status(400).send("bad link");
+    const meta = await fsGetDoc("tafweedFiles/" + id);
+    const mk = meta ? String(fv(meta, "k") || "") : "";
+    if (!meta || mk.length !== k.length || !crypto.timingSafeEqual(Buffer.from(mk), Buffer.from(k))) return res.status(404).send("not found");
+    const parts = Number(fv(meta, "parts") || 0);
+    let b64 = "";
+    for (let i = 0; i < parts; i++) {
+      const d = await fsGetDoc("tafweedFiles/" + id + "_p" + i);
+      b64 += String((d && fv(d, "b")) || "");
+    }
+    const buf = Buffer.from(b64, "base64");
+    const name = String(fv(meta, "name") || "tafweed.pdf");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", (req.query.dl ? "attachment" : "inline") + "; filename=\"tafweed.pdf\"; filename*=UTF-8''" + encodeURIComponent(name));
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.send(buf);
+  } catch (e) {
+    console.log("⚠️ tafweed/file: " + String((e && e.message) || e).slice(0, 200));
+    res.status(500).send("error");
   }
 });
 
