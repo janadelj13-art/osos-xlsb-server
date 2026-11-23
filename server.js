@@ -32,6 +32,7 @@ app.use(cors({ origin: "*" }));
 app.use("/api/vin/read", express.json({ limit: "8mb" }));     // صورة الشاصي (base64) أكبر من 1 ميجا أحيانًا
 app.use("/api/plates/read", express.json({ limit: "8mb" }));  // صورة جدول اللوحات
 app.use("/api/pull/send", express.json({ limit: "12mb" }));   // سحب مباشر: 5 صور
+app.use("/api/reports/ref-memory", express.json({ limit: "4mb" }));   // لوحات الإحالة + التشيك (20 ألف في الطلب)
 app.use(express.json({ limit: "1mb" })); // لازمة عشان endpoint استخراج أرقام اللوحات (بياخد JSON مش ملف)
 
 // نخزن الملف في الذاكرة مباشرة، مش على القرص أبدًا.
@@ -1409,6 +1410,10 @@ async function createAutoReports(byCompany) {
   if (!cosIn.length) return { reports: 0, handled: true };
   // نشيل اللوحات اللي اتكتبت قبل كده (نسخة تانية من نفس الشهادة «(1).pdf» أو اترفعت تاني)
   const have = await recentReportPlateKeys();
+  // اللوحات اللي نزلت في إحالة الأدمن (آخر 30 يوم) مابتدخلش التقارير خالص -- إلا اللي الأدمن رجّعها بإيده
+  let refMem = new Map(), refExempt = new Set();
+  try { refMem = await refMemLoad(false); refExempt = await refExemptKeys(); } catch (e) {}
+  let inRef = 0;
   const fresh = {};   // الشركة -> اللوحات الجديدة بس
   let dup = 0;
   for (const co of cosIn) {
@@ -1419,12 +1424,14 @@ async function createAutoReports(byCompany) {
       if (seenHere.has(k)) continue;
       seenHere.add(k);
       if (have.has(k)) { dup++; continue; }
+      if (refMem.has(k) && !refExempt.has(k)) { inRef++; continue; }
       have.add(k);
       (fresh[co] = fresh[co] || []).push(p);
     }
   }
   const cos = Object.keys(fresh);
-  if (!cos.length) return { reports: 0, dup, handled: true };   // مفيش جديد -> لا تقرير ولا إشعار
+  if (inRef) console.log("[auto-report] skipped (in referral memory): " + inRef);
+  if (!cos.length) return { reports: 0, dup, inRef, handled: true };   // مفيش جديد -> لا تقرير ولا إشعار
   const base = Date.now();
   let made = 0;
   const madeCos = [];
@@ -1625,6 +1632,73 @@ app.post("/api/reports/referral-hit", async (req, res) => {
    - اللوحات المسترجعة بتتسجّل في reportRefExempt/current عشان الإحالة ماتمسحهاش تاني (48 ساعة)
    ============================================================ */
 const REF_EXEMPT_MS = 48 * 3600 * 1000;
+/* ============================================================
+   «ذاكرة الإحالة» على السيرفر: كل لوحات الإحالة اللي الأدمن الرئيسي حمّلها (آخر 30 يوم)
+   - التطبيق بيرفعها لما الأدمن يحمّل إحالة (أرقام اللوحات بس)
+   - الاستخراج التلقائي (كل 5 دقايق) مابيحطش في التقارير أي لوحة موجودة فيها
+     -> الشهادة اللي تنزل بعد الإحالة بساعة أو يومين بتتشال لوحدها، حتى لو التطبيق مقفول أو الإحالة اتغيّرت
+   - كل لوحة بتفضل 30 يوم من آخر مرة ظهرت في إحالة
+   - ومعاها لوحات ملف التشيك بتاع الأدمن (شهادة لوحتها في التشيك = مش جديدة -> ماتدخلش التقرير)
+   - متقسمة على 64 مستند (refMemory/b0..b63) عشان حجم المستند الواحد
+   ============================================================ */
+const REF_MEM_DAYS = 30;
+const REF_MEM_BUCKETS = 64;   // الإحالة + ملف التشيك ممكن يبقوا مئات الآلاف
+let refMemCache = { map: null, at: 0 };
+function refMemBucket(k) { let h = 0; for (let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) >>> 0; return h % REF_MEM_BUCKETS; }
+async function refMemReadBucket(b) {
+  try {
+    const d = await fsGetDoc("refMemory/b" + b);
+    const raw = d ? fv(d, "d") : "";
+    const o = raw ? JSON.parse(raw) : {};
+    return o && typeof o === "object" ? o : {};
+  } catch (e) { return null; }   // null = ماقدرناش نقرا (مانكتبش فوقه)
+}
+async function refMemLoad(force) {
+  if (!force && refMemCache.map && Date.now() - refMemCache.at < 10 * 60 * 1000) return refMemCache.map;
+  const minT = Date.now() - REF_MEM_DAYS * 86400000;
+  const map = new Map();
+  const parts = await Promise.all(Array.from({ length: REF_MEM_BUCKETS }, (_, b) => refMemReadBucket(b)));
+  parts.forEach((o) => { if (o) Object.keys(o).forEach((k) => { if (o[k] >= minT) map.set(k, o[k]); }); });
+  refMemCache = { map, at: Date.now() };
+  return map;
+}
+async function refMemAdd(keys) {
+  const now = Date.now(), minT = now - REF_MEM_DAYS * 86400000;
+  const by = {};
+  keys.forEach((k) => { const b = refMemBucket(k); (by[b] = by[b] || []).push(k); });
+  let added = 0;
+  for (const b of Object.keys(by)) {
+    const o = await refMemReadBucket(b);
+    if (o === null) throw new Error("refMemory read failed");
+    Object.keys(o).forEach((k) => { if (!(o[k] >= minT)) delete o[k]; });   // اللي عدّى عليه 30 يوم يتشال
+    by[b].forEach((k) => { if (!o[k]) added++; o[k] = now; });
+    const r = await fetch(FS_DOCS + "/refMemory/b" + b, {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + (await gcpToken()), "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: { d: { stringValue: JSON.stringify(o) }, at: { timestampValue: new Date().toISOString() } } })
+    });
+    if (!r.ok) throw new Error("refMemory write HTTP " + r.status);
+  }
+  refMemCache = { map: null, at: 0 };
+  return added;
+}
+// الأدمن الرئيسي بيرفع لوحات الإحالة + ملف التشيك: POST /api/reports/ref-memory { keys: [...] } (لحد 20000 في الطلب)
+app.post("/api/reports/ref-memory", async (req, res) => {
+  try {
+    const uid = await uidFromReq(req);
+    if (!uid) return res.status(401).json({ ok: false, error: "auth" });
+    const me = await fsGetDoc("users/" + encodeURIComponent(uid));
+    if (!me || fv(me, "isAdmin") !== true) return res.status(403).json({ ok: false, error: "admin only" });
+    const sent = Array.isArray(req.body && req.body.keys) ? req.body.keys.slice(0, 20000) : [];
+    const keys = Array.from(new Set(sent.map(plateKeyLoose).filter(Boolean)));
+    if (!keys.length) return res.json({ ok: true, added: 0 });
+    const added = await refMemAdd(keys);
+    res.json({ ok: true, added, received: keys.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e).slice(0, 200) });
+  }
+});
+
 async function refExemptKeys() {
   try {
     const d = await fsGetDoc("reportRefExempt/current");
