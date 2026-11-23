@@ -716,6 +716,231 @@ app.post("/api/certificates/resolve-plates", async (req, res) => {
 
 
 /* ============================================================
+   الاستخراج الكامل للشهادة (شهادات يوم معيّن -> إكسل زي ملف المحفظة)
+   POST /api/certificates/extract-full  { ids: [...] }  -- للأدمن بس
+   الرد: { ok, results: { id: { fields: {اسم الحقل: القيمة}, found, total } | null }, errors }
+   مفيش أي حاجة بتتخزن: الشهادة بتتقري وترجع على طول.
+   ============================================================ */
+// استخراج كل بيانات شهادة «توثيق» (سند تنفيذي لاسترداد الأصل) من الـ PDF
+// النص بيتبني من الحروف نفسها (glyphs) عشان «لا/لأ/لى» تطلع صح، ويترتب سطر سطر من اليمين للشمال.
+async function certFixedItems(pdf, OPS) {
+  const page = await pdf.getPage(1);
+  const ol = await page.getOperatorList();
+  const map = new Map();
+  for (let i = 0; i < ol.fnArray.length; i++) {
+    if (ol.fnArray[i] !== OPS.showText) continue;
+    const gl = (ol.argsArray[i][0] || []).filter((g) => g && typeof g === "object" && g.unicode != null).map((g) => g.unicode);
+    const vis = gl.join("");
+    if (/[؀-ۿ]/.test(vis)) map.set([...vis].reverse().join("").trim(), gl.slice().reverse().join("").trim());
+  }
+  const tc = await page.getTextContent();
+  return tc.items.filter((it) => it.str && it.str.trim()).map((it) => {
+    const s = it.str.trim();
+    return { s: map.has(s) ? map.get(s) : s, x: it.transform[4], y: it.transform[5], w: it.width || 0 };
+  });
+}
+
+const CERT_SECTIONS = [
+  [/الصفة في العقد:? ?المؤجر/, "lessor"],
+  [/الصفة في العقد:? ?المستأجر/, "lessee"],
+  [/معلومات العقد محل التنفيذ/, "contract"],
+  [/معلومات الأصل المؤجر/, "asset"],
+];
+
+function certParseItems(items) {
+  const lines = new Map();
+  for (const it of items) { const k = Math.round(it.y / 3); if (!lines.has(k)) lines.set(k, []); lines.get(k).push(it); }
+  const keys = [...lines.keys()].sort((a, b) => b - a);
+  let sec = "head";
+  const out = {};               // "section|label" -> value
+  let fieldsInSec = [];          // الحقول اللي في القسم ده (عشان السطور اللي بتكمّل)
+  for (const k of keys) {
+    const arr = lines.get(k).sort((a, b) => b.x - a.x);
+    const lineText = arr.map((a) => a.s).join(" ");
+    const sw = CERT_SECTIONS.find(([re]) => re.test(lineText));
+    if (sw) { sec = sw[1]; fieldsInSec = []; continue; }
+    // نص الشروط اللي تحت (مش بيانات) -- بعده بيجي سطر تاريخ الإصدار والطباعة بس
+    if (/تم اصدار هذه الوثيقة من خلال|تستخدم هذه الوثيقة|يلغي صلاحيتها|يستخدم للغرض|شركة توثيق لتسجيل عقود الإيجار التمويلي -|www\.|Page \d+ of/.test(lineText)) { sec = "footer"; fieldsInSec = []; continue; }
+    if (sec === "head" && !/:/.test(lineText)) continue;
+    // تقسيم السطر لحتت: فراغ كبير بين كلمتين = حقل تاني
+    const segs = []; let cur = [];
+    for (let i = 0; i < arr.length; i++) {
+      const a = arr[i];
+      if (cur.length) {
+        const prev = cur[cur.length - 1];
+        const gap = prev.x - (a.x + a.w);
+        const prevIsColon = prev.s === ":" || /:$/.test(prev.s);
+        if (gap > 28 && !prevIsColon) { segs.push(cur); cur = []; }
+      }
+      cur.push(a);
+    }
+    if (cur.length) segs.push(cur);
+    for (const seg of segs) {
+      const ci = seg.findIndex((a) => a.s === ":" || /:$/.test(a.s));
+      const xs = seg.map((a) => a.x), xMax = Math.max(...seg.map((a) => a.x + a.w)), xMin = Math.min(...xs);
+      if (ci < 0) {
+        if (sec === "footer") continue;
+        // سطر بيكمّل حقل فوقه: أقرب حقل في نفس العمود
+        let best = null, bestD = 1e9;
+        for (const F of fieldsInSec) {
+          const d = Math.abs((F.lMin + F.lMax) / 2 - (xMin + xMax) / 2) < 1 ? 0 : Math.min(Math.abs(F.lMin - xMin), Math.abs(F.vMax - xMax), Math.abs(F.lMax - xMax));
+          if (xMax > F.vMin - 15 && xMin < F.lMax + 15 && d < bestD) { best = F; bestD = d; }
+        }
+        if (!best) continue;
+        // الكلمات اللي تحت عنوان الحقل = تكملة العنوان، والباقي تكملة القيمة
+        const labPart = seg.filter((a) => a.x >= best.lMin - 8 && /^[\u0600-\u06FF]+$/.test(a.s));
+        const valPart = seg.filter((a) => labPart.indexOf(a) < 0);
+        if (labPart.length) {
+          const old = best.key; best.label += " " + labPart.map((a) => a.s).join(" ");
+          best.key = best.sec + "|" + best.label; out[best.key] = out[old]; delete out[old];
+        }
+        if (valPart.length) out[best.key] = ((out[best.key] || "") + " " + orderLtr(valPart)).trim();
+        continue;
+      }
+      const label = seg.slice(0, ci + 1).map((a) => a.s.replace(/:$/, "")).filter(Boolean).join(" ").trim();
+      const valSeg = seg.slice(ci + 1);
+      const key = sec + "|" + label;
+      out[key] = orderLtr(valSeg);
+      const labX = seg.slice(0, ci + 1).map((a) => a.x);
+      fieldsInSec.push({ key, sec, label, lMin: Math.min(...labX), lMax: xMax, vMin: valSeg.length ? Math.min(...valSeg.map((a) => a.x)) : Math.min(...labX), vMax: valSeg.length ? Math.max(...valSeg.map((a) => a.x + a.w)) : Math.min(...labX) });
+    }
+  }
+  // «العنوان» في سطر و«الوطني:» في السطر اللي بعده
+  for (const k of Object.keys(out)) {
+    const m = k.match(/^(\w+)\|الوطني$/);
+    if (m && out[m[1] + "|العنوان الوطني"] == null) { out[m[1] + "|العنوان الوطني"] = out[k]; delete out[k]; }
+  }
+  return out;
+}
+// القيمة: الكلمات من اليمين للشمال، بس الأرقام/الإنجليزي اللي جنب بعض تفضل بترتيبها
+function orderLtr(seg) {
+  const toks = seg.slice().sort((a, b) => b.x - a.x);
+  const out = []; let run = [];
+  const isLtr = (s) => /^[A-Za-z]+$/.test(s);   // كلمات إنجليزي ورا بعض بس (زي Not Applicable)
+  for (const t of toks) {
+    if (isLtr(t.s)) run.push(t); else { if (run.length) { out.push(...run.reverse()); run = []; } out.push(t); }
+  }
+  if (run.length) out.push(...run.reverse());
+  return out.map((t) => t.s).join(" ").replace(/\s+/g, " ").trim();
+}
+
+// أسماء الحقول بالترتيب اللي هتطلع بيه (زي ملف المحفظة الأول، وبعدين الباقي)
+const CERT_FIELDS = [
+  ["رقم العقد المسجل", "head|رقم العقد المسجل"],
+  ["رقم الأصل المسجل", "head|رقم الأصل المسجل"],
+  ["رقم السند", "head|رقم السند"],
+  ["سبب التنفيذ", "contract|سبب التنفيذ"],
+  ["رقم اللوحة", "asset|رقم اللوحة"],
+  ["نوع الأصل (الطراز)", "asset|نوع الأصل"],
+  ["المؤجر", "lessor|الاسم"],
+  ["رقم الهيكل", "asset|رقم الهيكل"],
+  ["المصنع", "asset|المصنع"],
+  ["سنة الصنع", "asset|سنة الصنع"],
+  ["لون الأصل", "asset|لون الأصل"],
+  ["اسم المستأجر", "lessee|الاسم"],
+  ["تاريخ تسجيل الأصل", "head|تاريخ تسجيل الأصل"],
+  ["الرقم الوطني الموحد للمؤجر", "lessor|الرقم الوطني الموحد"],
+  ["مدينة المؤجر", "lessor|المدينة"],
+  ["عنوان المؤجر", "lessor|العنوان الوطني"],
+  ["رقم تواصل المؤجر", "lessor|رقم التواصل"],
+  ["رقم الترخيص", "lessor|رقم الترخيص"],
+  ["السجل التجاري", "lessor|رقم السجل التجاري"],
+  ["رقم هوية المستأجر", "lessee|رقم الهوية"],
+  ["نوع الهوية", "lessee|نوع الهوية"],
+  ["تاريخ انتهاء الهوية", "lessee|تاريخ انتهاء الهوية"],
+  ["تاريخ الميلاد", "lessee|تاريخ الميلاد"],
+  ["رقم تواصل المستأجر", "lessee|رقم التواصل"],
+  ["الجنسية", "lessee|الجنسية"],
+  ["مصدر الهوية", "lessee|مصدرها"],
+  ["عنوان المستأجر", "lessee|العنوان الوطني"],
+  ["رقم العقد", "contract|رقم العقد"],
+  ["حالة العقد", "contract|حالة العقد"],
+  ["تاريخ انتهاء العقد", "contract|تاريخ انتهاء العقد"],
+  ["المبلغ المستحق", "contract|المبلغ المستحق"],
+  ["الدفعات الحالة", "contract|الدفعات الحالة"],
+  ["مكان الوفاء", "contract|مكان الوفاء"],
+  ["مكان التحرير", "contract|مكان التحرير"],
+  ["الحقوق المتعلقة للأصل المؤجر", "contract|الحقوق المتعلقة للأصل المؤجر"],
+  ["إشعار بسداد الدفعات المتأخرة", "contract|حالة اشعار المؤجر للمستأجر بسداد الدفعات المتأخرة"],
+  ["إشعار عند التعثر", "contract|حالة اشعار المؤجر للمستأجر عند التعثر"],
+  ["تعذر الاتفاق", "contract|حالة تعذر الاتفاق بين المؤجر والمستأجر"],
+  ["إشعار بفسخ العقد", "contract|حالة اشعار المؤجر للمستأجر بفسخ العقد"],
+  ["الرقم التسلسلي", "asset|الرقم التسلسلي"],
+  ["بلد المنشأ", "asset|بلد المنشأ"],
+  ["مستند إثبات الملكية", "asset|نوع مستند اثبات الملكية"],
+  ["التأمين", "asset|التامين"],
+  ["تاريخ إصدار السند", "footer|تاريخ اصدار السند"],
+  ["تاريخ طباعة الشهادة", "footer|تاريخ طباعة الشهادة"],
+];
+
+async function extractCertFields(pdf, OPS) {
+  const items = await certFixedItems(pdf, OPS);
+  const raw = certParseItems(items);
+  const fields = {};
+  let n = 0;
+  for (const [name, key] of CERT_FIELDS) { const v = raw[key]; if (v != null && v !== "") { fields[name] = v; n++; } }
+  return { fields, found: n, total: CERT_FIELDS.length, raw };
+}
+
+let __pdfOpsShowText = 44;   // رقم أمر «كتابة نص» في pdf.js (ثابت)، وبنتأكد منه من المكتبة لو متاحة
+(async () => { try { const m = require("unpdf"); if (typeof m.getResolvedPDFJS === "function") { const p = await m.getResolvedPDFJS(); if (p && p.OPS && p.OPS.showText) __pdfOpsShowText = p.OPS.showText; } } catch (e) {} })();
+
+// الأدمن بس: بنسأل سيرفر الشهادات (Cloudflare) بنفس دخول المستخدم -- لو مش أدمن بيرفض
+const __adminCheckCache = new Map();
+async function isCertAdmin(authHeader) {
+  if (!authHeader) return false;
+  const c = __adminCheckCache.get(authHeader);
+  if (c && Date.now() < c.exp) return c.ok;
+  let ok = false;
+  try {
+    const r = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/accounts", { headers: { Authorization: authHeader } });
+    ok = r.status !== 401 && r.status !== 403 && r.status < 500;
+  } catch (e) { ok = false; }
+  __adminCheckCache.set(authHeader, { ok, exp: Date.now() + 5 * 60 * 1000 });
+  if (__adminCheckCache.size > 200) __adminCheckCache.delete(__adminCheckCache.keys().next().value);
+  return ok;
+}
+
+async function extractFullOne(id, authHeader) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS);
+  try {
+    const res = await fetch(CERT_DOWNLOAD_BASE + "/api/certificates/" + encodeURIComponent(id) + "/download", {
+      signal: controller.signal, headers: { Authorization: authHeader }
+    });
+    if (!res.ok) return { error: "download HTTP " + res.status };
+    const pdf = await getDocumentProxy(new Uint8Array(await res.arrayBuffer()));
+    const r = await extractCertFields(pdf, { showText: __pdfOpsShowText });
+    return { fields: r.fields, found: r.found, total: r.total };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+app.post("/api/certificates/extract-full", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+    if (!(await isCertAdmin(authHeader))) return res.status(403).json({ ok: false, error: "admin_only" });
+    const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids : [];
+    const cleanIds = Array.from(new Set(ids.filter((x) => typeof x === "string" && x.trim()))).slice(0, CERT_RESOLVE_MAX_IDS);
+    if (!cleanIds.length) return res.status(400).json({ ok: false, error: "لا يوجد ids" });
+    const results = {}, errors = {};
+    await mapWithConcurrency(cleanIds, CERT_RESOLVE_CONCURRENCY, async (id) => {
+      try {
+        const r = await withTimeout(extractFullOne(id, authHeader), CERT_RESOLVE_PER_ITEM_TIMEOUT_MS + 5000, null);
+        if (!r) { results[id] = null; errors[id] = "timeout"; return; }
+        if (r.error) { results[id] = null; errors[id] = r.error; return; }
+        results[id] = r;
+      } catch (e) { results[id] = null; errors[id] = "exception: " + String((e && e.message) || e).slice(0, 80); }
+    });
+    try { console.log("[extract-full] n=" + cleanIds.length + " ok=" + cleanIds.filter((i) => results[i]).length); } catch (_) {}
+    res.json({ ok: true, results, errors });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
+});
+
+/* ============================================================
    استخراج تلقائي بالليل (من غير ما حد يفتح التطبيق)
    - Worker الشهادات بينده على POST /api/certificates/auto-run كل 5 دقايق بمفتاح سري (SERVER_KEY)
    - السيرفر بيجيب الشهادات الجديدة، يستخرج لوحاتها وأسماء مؤجريها، ويحفظ النتايج في Firestore
