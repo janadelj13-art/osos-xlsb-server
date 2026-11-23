@@ -1852,10 +1852,13 @@ async function visionReadPlates(model, b64, mime) {
         { type: "text", text:
           "The image contains Saudi vehicle license plate numbers (for example a table/spreadsheet column, a registration form, or a screenshot). " +
           "List EVERY plate number in the image, in order from top to bottom, including repeated ones. Do not skip rows. " +
-          "A plate has 3 letters and 1 to 4 digits. Letters are written either in Arabic (e.g. \"ر م ع 8929\") or in English (e.g. \"7228 ABS\"). " +
+          "A plate has 3 letters and 1 to 4 digits. Letters are written in Arabic (e.g. \"ر م ع 8929\"), in English (e.g. \"7228 ABS\"), or BOTH. " +
+          "If the same plate appears in Arabic AND in English (for example two columns in the same table row, or the two lines of a registration form), return it ONCE with both \"ar\" and \"en\" filled. " +
+          "The English letters are the most important: copy them exactly, left to right. " +
           "Saudi plate Arabic letters are ONLY these 17: ا ب ح د ر س ص ط ع ق ك ل م ن ه و ى -- look closely at each letter, they are small and spaced; " +
           "do not confuse ه with م, ح with ج, ى with ي/ب, ر with د/و, ص with ض, ع with غ, ط with ظ. " +
-          "Copy the digits exactly. For Arabic letters give them in normal reading order (right to left as written, first letter = rightmost). " +
+          "Copy the digits exactly. For Arabic letters give them in reading order: the FIRST letter is the RIGHTMOST letter in the image " +
+          "(e.g. if the cell shows \"ب ط و ٨٩٣٥\" with ب at the right end, answer \"بطو\", NOT \"وطب\"). " +
           "For English letters give them left to right exactly as written. Ignore other numbers (contract numbers, phone numbers, years, dates, chassis numbers). " +
           "If a character is unreadable put ? in its place. " +
           "Reply with JSON only, no other text: {\"plates\":[{\"ar\":\"رمع\",\"en\":\"\",\"digits\":\"8929\"},{\"ar\":\"\",\"en\":\"ABS\",\"digits\":\"7228\"}]}  -- or {\"plates\":[]} if there are none." }
@@ -1875,14 +1878,24 @@ async function visionReadPlates(model, b64, mime) {
     const digits = plDigits(p && p.digits);
     if (!digits || digits.length > 4) continue;
     const en = String((p && p.en) || "").toUpperCase().replace(/[^A-Z?]/g, "");
-    let ar = plNormAr(p && p.ar), latin = "";
-    if (ar.length !== 3 && en.length === 3) {                                       // العربي ناقص والإنجليزي كامل -> ناخد الإنجليزي
-      ar = en.split("").reverse().map((c) => PL_EN_AR[c] || "؟").join("");        // الإنجليزي عكس ترتيب العربي
+    let ar = plNormAr(p && p.ar), latin = "", fromEn = false;
+    // الحروف الإنجليزي هي المرجع لو موجودة: ترتيبها مش بيتلخبط (دايمًا شمال -> يمين) وكل حرف ليه حرف عربي واحد.
+    // العربي = الإنجليزي بالعكس (LRR -> ر ر ل). جربناها على «كشف سحب مباشر» 23/11: الموديل كان قاري العربي بالمقلوب
+    // (لرر بدل ررل، همر بدل رمه، وطب بدل بطو) وغلط حرف (طمس بدل سصط) -- والإنجليزي كان صح في الكل.
+    const enAr = (en.length === 3 && en.split("").every((c) => PL_EN_AR[c])) ? en.split("").reverse().map((c) => PL_EN_AR[c]).join("") : "";
+    if (enAr) {
+      if (ar && ar !== enAr) console.log("🔎 plates عربي اتصلّح من الإنجليزي (" + (ar.split("").reverse().join("") === enAr ? "ترتيب" : "حروف") + ")");
+      ar = enAr; latin = en.split("").join(" "); fromEn = true;
+    } else if (ar.length !== 3 && en.length === 3) {                               // إنجليزي فيه حرف مش مقروء
+      ar = en.split("").reverse().map((c) => PL_EN_AR[c] || "؟").join("");
       latin = en.split("").join(" ");
     }
     if (!ar) continue;                                                              // أرقام من غير حروف = مش لوحة
     const ok = ar.length === 3 && ar.split("").every((c) => PL_AR_OK.has(c));
-    res.push({ ar, digits, latin, ok });
+    // نفس اللوحة اتكتبت مرتين (عمود عربي + عمود إنجليزي في نفس الصف) -> مرة واحدة
+    const prev = res[res.length - 1];
+    if (prev && prev.digits === digits && prev.ar === ar) { if (fromEn && !prev.fromEn) { prev.latin = latin; prev.fromEn = true; } continue; }
+    res.push({ ar, digits, latin, ok, fromEn });
   }
   return res;
 }
@@ -1926,7 +1939,12 @@ app.post("/api/plates/read", async (req, res) => {
         const q = pool.find((x) => !x.used && x.p.digits === p.digits);
         if (!q) { p.check = true; diff++; continue; }
         q.used = true;
-        if (q.p.ar !== p.ar) { p.check = true; p.alt = q.p.ar; diff++; }
+        if (q.p.ar !== p.ar) {
+          // اللي اتاخد من الحروف الإنجليزي هو الصح؛ لو الاتنين من الإنجليزي ومختلفين يبقى «راجعها»
+          if (q.p.fromEn && !p.fromEn) { p.ar = q.p.ar; p.latin = q.p.latin; p.fromEn = true; p.ok = q.p.ok; continue; }
+          if (p.fromEn && !q.p.fromEn) continue;
+          p.check = true; p.alt = q.p.ar; diff++;
+        }
       }
     }
     // من غير اللوحات نفسها في اللوج -- بس العدد والوقت
