@@ -1861,6 +1861,8 @@ async function visionReadPlates(model, b64, mime) {
           "(e.g. if the cell shows \"ب ط و ٨٩٣٥\" with ب at the right end, answer \"بطو\", NOT \"وطب\"). " +
           "For English letters give them left to right exactly as written. Ignore other numbers (contract numbers, phone numbers, years, dates, chassis numbers). " +
           "If a character is unreadable put ? in its place. " +
+          "If a row clearly has a plate but part of it is hidden (covered by something, cut off, blurred), STILL include it with ? for each hidden letter/digit " +
+          "(e.g. {\"ar\":\"\",\"en\":\"S?S\",\"digits\":\"93?3\"}). If the whole plate in that row is hidden, include {\"ar\":\"\",\"en\":\"\",\"digits\":\"\",\"hidden\":true}. " +
           "Reply with JSON only, no other text: {\"plates\":[{\"ar\":\"رمع\",\"en\":\"\",\"digits\":\"8929\"},{\"ar\":\"\",\"en\":\"ABS\",\"digits\":\"7228\"}]}  -- or {\"plates\":[]} if there are none." }
       ] }]
     }, think ? { thinking: { type: "disabled" } } : {}))
@@ -1874,9 +1876,14 @@ async function visionReadPlates(model, b64, mime) {
   let j = null; try { j = m ? JSON.parse(m[0]) : null; } catch (e) {}
   if (!j || !Array.isArray(j.plates)) console.log("🔎 plates رد مش مفهوم (" + model + ", " + ((d && d.stop_reason) || "") + ")");
   const res = [];
+  res.unreadable = 0;   // صفوف فيها لوحة بس مش باينة خالص (متغطية) -- بتتعد عشان الظابط يعرف إن فيه لوحات ماتقراتش
   for (const p of (j && Array.isArray(j.plates)) ? j.plates : []) {
-    const digits = plDigits(p && p.digits);
-    if (!digits || digits.length > 4) continue;
+    // الأرقام: علامة ? = رقم مش باين (بتفضل في اللوحة عشان الظابط يكمّلها بإيده)
+    const digits = String((p && p.digits) || "").replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x660)).replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x6F0)).replace(/[؟]/g, "?").replace(/[^0-9?]/g, "");
+    if (!/[0-9]/.test(digits) || digits.length > 4) {
+      if ((p && p.hidden) || /\?/.test(digits) || /\?/.test(String((p && p.en) || "") + String((p && p.ar) || ""))) res.unreadable++;
+      continue;
+    }
     const en = String((p && p.en) || "").toUpperCase().replace(/[^A-Z?]/g, "");
     let ar = plNormAr(p && p.ar), latin = "", fromEn = false;
     // الحروف الإنجليزي هي المرجع لو موجودة: ترتيبها مش بيتلخبط (دايمًا شمال -> يمين) وكل حرف ليه حرف عربي واحد.
@@ -1890,8 +1897,8 @@ async function visionReadPlates(model, b64, mime) {
       ar = en.split("").reverse().map((c) => PL_EN_AR[c] || "؟").join("");
       latin = en.split("").join(" ");
     }
-    if (!ar) continue;                                                              // أرقام من غير حروف = مش لوحة
-    const ok = ar.length === 3 && ar.split("").every((c) => PL_AR_OK.has(c));
+    if (!ar) { if (/\?/.test(digits)) res.unreadable++; continue; }               // أرقام من غير حروف = مش لوحة (إلا لو متغطية)
+    const ok = ar.length === 3 && ar.split("").every((c) => PL_AR_OK.has(c)) && !/\?/.test(digits);
     // نفس اللوحة اتكتبت مرتين (عمود عربي + عمود إنجليزي في نفس الصف) -> مرة واحدة
     const prev = res[res.length - 1];
     if (prev && prev.digits === digits && prev.ar === ar) { if (fromEn && !prev.fromEn) { prev.latin = latin; prev.fromEn = true; } continue; }
@@ -1948,8 +1955,8 @@ app.post("/api/plates/read", async (req, res) => {
       }
     }
     // من غير اللوحات نفسها في اللوج -- بس العدد والوقت
-    console.log("🔎 plates [" + uid.slice(0, 6) + "] " + model + ": " + plates.length + " لوحة (" + plates.filter((p) => !p.ok).length + " مش كاملة، " + diff + " مختلفة بين القرايتين) في " + (Date.now() - t0) + "ms");
-    res.json({ ok: true, plates });
+    console.log("🔎 plates [" + uid.slice(0, 6) + "] " + model + ": " + plates.length + " لوحة (" + plates.filter((p) => !p.ok).length + " مش كاملة، " + (main.r.unreadable || 0) + " مش باينة، " + diff + " مختلفة بين القرايتين) في " + (Date.now() - t0) + "ms");
+    res.json({ ok: true, plates, unreadable: main.r.unreadable || 0 });
   } catch (e) {
     console.log("⚠️ plates: " + String((e && e.message) || e).slice(0, 200));
     res.status(502).json({ ok: false, error: "read" });
